@@ -101,12 +101,7 @@ Write-Step "Step 4: Checking pgvector extension ..."
 $ErrorActionPreference = "Continue"
 $extCheck = wsl -u postgres psql -d github_knowledge_hub -tAc "SELECT 1 FROM pg_extension WHERE extname='vector'" *>$null
 if ($LASTEXITCODE -ne 0 -or $extCheck -notmatch "1") {
-    Write-Warn "pgvector extension not found, installing ..."
-    wsl -u postgres psql -d github_knowledge_hub -c "CREATE EXTENSION IF NOT EXISTS vector;" *>$null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Err "Failed to install pgvector"
-    }
-    Write-OK "pgvector extension installed"
+    Write-Err "pgvector extension not found. Review the maintenance guide and run: npm run db:deploy"
 } else {
     Write-OK "pgvector extension ready"
 }
@@ -236,8 +231,8 @@ if (-not $openaiKey) {
 
 Write-OK "Environment variables check complete"
 
-# Step 6: Prisma
-Write-Step "Step 6: Prisma validate & sync ..."
+# Step 6: Prisma (read-only startup checks)
+Write-Step "Step 6: Prisma validate & migration status ..."
 
 Set-Location $ProjectRoot
 
@@ -251,15 +246,15 @@ if ($LASTEXITCODE -ne 0) {
 $ErrorActionPreference = "Stop"
 Write-OK "prisma validate passed"
 
-Write-Host "  Running prisma db push ..."
+Write-Host "  Running prisma migrate status ..."
 $ErrorActionPreference = "Continue"
-npx prisma db push *>$null
+npx prisma migrate status
 if ($LASTEXITCODE -ne 0) {
     $ErrorActionPreference = "Stop"
-    Write-Err "prisma db push failed"
+    Write-Err "Database migrations are not up to date. Review the maintenance guide and run: npm run db:deploy"
 }
 $ErrorActionPreference = "Stop"
-Write-OK "prisma db push done"
+Write-OK "Database migrations are up to date"
 
 # Step 7: Check port 3000
 Write-Step "Step 7: Checking port 3000 ..."

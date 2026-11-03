@@ -72,7 +72,7 @@ flowchart LR
 
 - 只使用页面、同步、笔记和同步摘要时，可以只运行 Web。
 - 使用知识资产提取时，必须额外运行 `npm run worker`。
-- 当前桌面快捷方式只启动 Web，不代表完整 Web+Worker 环境。
+- 桌面快捷方式默认同时启动 Web 和 Worker，并分别维护 PID 与日志；重复启动复用现有实例。
 - 当前 Worker 领取逻辑不适合多实例；扩展前需实现数据库原子领取和租约恢复。
 
 ## 4. 主要数据流
@@ -105,11 +105,11 @@ flowchart LR
 
 - **semantic**：查询文本生成向量，使用 pgvector cosine distance。
 - **keyword**：使用 `searchVector @@ websearch_to_tsquery` 和 `ts_rank`。
-- **hybrid**：源码中使用向量相似度和全文 rank 加权排序。
+- **hybrid**：`(1 - cosineDistance) * 0.7 + ts_rank * 0.3` 加权排序。
 - **相似推荐**：以现有 RepoEmbedding/Embedding 为目标向量查找邻居。
 - 所有查询都必须按 userId 隔离。
 
-keyword/hybrid 依赖正确 generated column 和 GIN；当前环境存在 P0 schema 不一致，不能仅凭源码认定可用。
+keyword/hybrid 依赖 generated column 和 GIN。真实 Docker 数据库已完成 migration；三模式及用户隔离行为已在隔离 PostgreSQL 中验证，真实 semantic/hybrid 仍取决于有效 RepoEmbedding 和 Embedding provider。
 
 ## 5. 数据库实体关系
 
@@ -186,6 +186,8 @@ erDiagram
 - Analysis.repositoryId 可空，删除 Repository 时设为 null，用户删除时级联删除 Analysis。
 - KnowledgeAsset 与 Collection 通过 CollectionAsset 多对多关联。
 - 两个 Embedding 表均为 1536 维，模型/维度变更需要 schema migration。
+- `Repository.searchVector` 是由 name、description、topics 派生的 stored generated `tsvector`；GIN 名为 `Repository_searchVector_idx`。
+- PostgreSQL 将通用 `array_to_string` 标为 stable，因此 migration 提供仅限 `text[]` 的 immutable SQL wrapper `gkh_text_array_to_string`。Prisma schema 用 `@default(dbgenerated())` 和 `@@index(..., type: Gin)` 声明原生对象，表达式本体仍由 SQL migration 管理。
 - `Analysis` 同时是历史和队列，扩展 Worker 时需补充原子领取、幂等和租约。
 
 ## 6. 代码分层
@@ -199,8 +201,9 @@ src/services/knowledge/  代码资产提取
 src/services/intake/     Analysis 入队
 src/lib/                 Prisma/OpenAI 客户端、GitHub Token、工具
 workers/                 独立后台进程
-prisma/                  schema 与全文搜索 SQL
-scripts/                 本地启动和 Embedding 回填
+prisma/migrations/       Prisma 基线与原生搜索对象 migration
+scripts/                 桌面启动/停止、migration 与隔离测试工具
+tests/                   单元测试与隔离 PostgreSQL 集成测试
 docs/                    维护、架构与路线图
 ```
 
@@ -212,9 +215,16 @@ docs/                    维护、架构与路线图
 - WSL 和 Docker 是两套数据库部署方式，数据卷不共享。
 - 生产环境应使用外部备份、版本化 migration、HTTPS、独立 Web/Worker 进程管理和秘密管理。
 
+### Migration 与本地进程边界
+
+- 新环境由 `npm run db:deploy` 应用版本化 migrations；旧 `db push` 环境只能在备份恢复验证和 schema 检查后显式 baseline。
+- 桌面启动只读取 migration 状态，不修改 schema；结构升级是独立维护动作，不与 Web/Worker 生命周期耦合。
+- `scripts/start-desktop.ps1` 以 PID + StartTime 管理 Web/Worker，日志写入 `logs/`，停止脚本只处理匹配的本项目进程。
+- 这是本地开发进程管理，不是带自动重启、健康修复和生产保活能力的 supervisor。
+
 ## 8. 架构演进顺序
 
-1. 先修复版本控制、migration、全文搜索和 smoke test。
-2. 再完成 Token 加密、Worker 原子领取和 CI。
+1. 版本控制、migration、全文搜索和核心 smoke test 已于 2026-11-03 完成。
+2. 下一阶段完成 Token 加密、Worker 原子领取和 CI。
 3. 然后统一摘要执行链、补齐遥测和收藏集。
 4. 只有在真实负载证明需要时，才考虑 Redis 队列、对象存储或独立 API；不要提前引入微服务。

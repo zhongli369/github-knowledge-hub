@@ -25,6 +25,7 @@
 # test and coverage
 /coverage/
 /.nyc_output/
+/.run/
 
 # caches
 /.cache/

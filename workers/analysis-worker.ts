@@ -5,22 +5,22 @@
  * Polls for "pending" analyses and processes them via the LLM service.
  */
 
-import { PrismaClient } from "@prisma/client"
+import path from "node:path"
+import { pathToFileURL } from "node:url"
+import { prisma } from "@/lib/prisma"
 import { analyzeRepoSummary } from "@/services/llm/analysis.service"
 import { extractAssetsFromRepo } from "@/services/knowledge/extraction.service"
 import { createOctokit } from "@/lib/github/client"
-
-const prisma = new PrismaClient()
 
 const POLL_INTERVAL_MS = 5_000
 const MAX_CONCURRENT = 3
 
 let running = 0
 
-async function processOne(): Promise<boolean> {
+export async function processOne(): Promise<boolean> {
   if (running >= MAX_CONCURRENT) return false
 
-  // Atomically claim a pending analysis
+  // Claim a pending analysis. Atomic multi-worker claiming is tracked separately.
   const analysis = await prisma.analysis.findFirst({
     where: { status: "pending" },
     orderBy: { createdAt: "asc" },
@@ -183,7 +183,7 @@ async function processOne(): Promise<boolean> {
   return true
 }
 
-async function main() {
+export async function main() {
   console.log("[worker] Analysis worker started")
 
   const shutdown = async () => {
@@ -211,4 +211,11 @@ async function main() {
   }
 }
 
-main()
+const entryUrl = process.argv[1] ? pathToFileURL(path.resolve(process.argv[1])).href : null
+if (entryUrl === import.meta.url) {
+  main().catch(async (error) => {
+    console.error("[worker] Fatal startup error:", error)
+    await prisma.$disconnect()
+    process.exit(1)
+  })
+}

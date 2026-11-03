@@ -91,13 +91,15 @@ model Repository {
   knowledgeAssets KnowledgeAsset[]
   analyses        Analysis[]
   repoEmbedding   RepoEmbedding?
-  searchVector    Unsupported("tsvector")?
+  // Stored generated column; its expression is managed in migration 20261103231000.
+  searchVector    Unsupported("tsvector")? @default(dbgenerated())
   createdAt       DateTime         @default(now())
   updatedAt       DateTime         @updatedAt
 
   @@index([userId])
   @@index([language])
   @@index([stars])
+  @@index([searchVector], type: Gin)
 }
 
 model KnowledgeAsset {

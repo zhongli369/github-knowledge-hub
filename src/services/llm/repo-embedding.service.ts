@@ -228,7 +228,7 @@ function searchHybrid(
       ${SEARCH_SELECT},
       1 - (re."vector" <=> $1::vector) AS "similarity",
       ts_rank(r."searchVector", websearch_to_tsquery('english', $2)) AS "textRank",
-      1 - (re."vector" <=> $1::vector) * 0.7 +
+      (1 - (re."vector" <=> $1::vector)) * 0.7 +
         COALESCE(ts_rank(r."searchVector", websearch_to_tsquery('english', $2)), 0) * 0.3
         AS "hybridScore"
     FROM "RepoEmbedding" re
@@ -253,21 +253,25 @@ export async function searchReposByText(
   filters?: SearchFilters,
   searchMode: SearchMode = "hybrid"
 ): Promise<SearchResult[]> {
+  const normalizedQuery = query.trim()
+  if (!normalizedQuery || !userId.trim() || !Number.isFinite(limit) || limit <= 0) return []
+
+  const normalizedLimit = Math.min(Math.floor(limit), 100)
   let sql: string
   let params: unknown[]
 
   if (searchMode === "keyword") {
     // Pure full-text search — no embedding API call
-    ;({ sql, params } = searchKeyword(query, userId, limit, filters))
+    ;({ sql, params } = searchKeyword(normalizedQuery, userId, normalizedLimit, filters))
   } else if (searchMode === "semantic") {
-    const embedding = await generateEmbedding(query)
+    const embedding = await generateEmbedding(normalizedQuery)
     const vectorStr = `[${embedding.join(",")}]`
-    ;({ sql, params } = searchSemantic(vectorStr, userId, limit, filters))
+    ;({ sql, params } = searchSemantic(vectorStr, userId, normalizedLimit, filters))
   } else {
     // hybrid (default) — semantic + keyword weighted fusion
-    const embedding = await generateEmbedding(query)
+    const embedding = await generateEmbedding(normalizedQuery)
     const vectorStr = `[${embedding.join(",")}]`
-    ;({ sql, params } = searchHybrid(vectorStr, query, userId, limit, filters))
+    ;({ sql, params } = searchHybrid(vectorStr, normalizedQuery, userId, normalizedLimit, filters))
   }
 
   const results = await prisma.$queryRawUnsafe<SearchRow[]>(sql, ...params)

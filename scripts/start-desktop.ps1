@@ -1,39 +1,39 @@
 <#
 .SYNOPSIS
-  GitHub Knowledge Hub — Docker desktop launcher for Windows.
+  GitHub Knowledge Hub — reliable Windows desktop launcher.
 .DESCRIPTION
-  Starts Docker Desktop when needed, starts PostgreSQL, synchronizes Prisma,
-  launches Next.js, and opens the browser after the app becomes reachable.
-.PARAMETER NoBrowser
-  Start the services without opening the default browser.
+  Starts PostgreSQL, validates migration state without changing schema, then
+  starts Next.js and the analysis worker with separate PID files and logs.
+.PARAMETER SmokeTest
+  Verify both processes and stop only the processes started by this invocation.
 #>
 [CmdletBinding()]
 param(
-    [switch]$NoBrowser
+    [switch]$NoBrowser,
+    [switch]$SmokeTest,
+    [ValidateRange(1, 65535)]
+    [int]$Port = 3000
 )
 
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $ComposeFile = Join-Path $ProjectRoot "docker-compose.yml"
-$AppUrl = "http://localhost:3000"
+$AppUrl = "http://localhost:$Port"
 $ContainerName = "github-knowledge-hub-db"
-$BrowserJob = $null
+$RuntimeDir = if ($env:GKH_RUNTIME_DIR) { $env:GKH_RUNTIME_DIR } else { Join-Path $ProjectRoot ".run" }
+$LogDir = if ($env:GKH_LOG_DIR) { $env:GKH_LOG_DIR } else { Join-Path $ProjectRoot "logs" }
+$StartedProcesses = @()
+$ExitCode = 0
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
+New-Item -ItemType Directory -Force -Path $RuntimeDir, $LogDir | Out-Null
 
-function Write-Step([string]$Message) {
-    Write-Host "`n>>> $Message" -ForegroundColor Yellow
-}
-
-function Write-OK([string]$Message) {
-    Write-Host "  OK  $Message" -ForegroundColor Green
-}
+function Write-Step([string]$Message) { Write-Host "`n>>> $Message" -ForegroundColor Yellow }
+function Write-OK([string]$Message) { Write-Host "  OK  $Message" -ForegroundColor Green }
 
 function Assert-NativeSuccess([string]$Message) {
-    if ($LASTEXITCODE -ne 0) {
-        throw $Message
-    }
+    if ($LASTEXITCODE -ne 0) { throw $Message }
 }
 
 function Test-DockerEngine {
@@ -43,9 +43,7 @@ function Test-DockerEngine {
         docker info *> $null
         return $LASTEXITCODE -eq 0
     }
-    finally {
-        $ErrorActionPreference = $previousPreference
-    }
+    finally { $ErrorActionPreference = $previousPreference }
 }
 
 function Test-App {
@@ -53,138 +51,195 @@ function Test-App {
         $response = Invoke-WebRequest -Uri $AppUrl -UseBasicParsing -TimeoutSec 3
         return $response.StatusCode -ge 200 -and $response.StatusCode -lt 500
     }
-    catch {
-        return $false
-    }
+    catch { return $false }
 }
 
-trap {
-    Write-Host "`nStartup failed: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host "Review the messages above. No running process was stopped by this launcher." -ForegroundColor Gray
-    exit 1
-}
+function Get-RecordPath([string]$Name) { return Join-Path $RuntimeDir "$Name.json" }
 
-Write-Host "====================================================" -ForegroundColor Cyan
-Write-Host "  GitHub Knowledge Hub -- Docker Desktop Launcher" -ForegroundColor Cyan
-Write-Host "===================================================="
-
-foreach ($commandName in @("docker", "npx.cmd", "npm.cmd")) {
-    if (-not (Get-Command $commandName -ErrorAction SilentlyContinue)) {
-        throw "Required command not found: $commandName"
-    }
-}
-if (-not (Test-Path $ComposeFile)) {
-    throw "Compose file not found: $ComposeFile"
-}
-
-Write-Step "Checking for an existing app instance ..."
-if (Test-App) {
-    Write-OK "$AppUrl is already reachable"
-    if (-not $NoBrowser) {
-        Start-Process -FilePath $AppUrl
-    }
-    Write-Host "No duplicate server was started." -ForegroundColor Gray
-    return
-}
-
-$listener = Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue
-if ($listener) {
-    $occupyingPid = ($listener | Select-Object -First 1).OwningProcess
-    throw "Port 3000 is occupied by PID $occupyingPid, but $AppUrl is unavailable. Stop that process manually, then retry."
-}
-Write-OK "Port 3000 is free"
-
-Write-Step "Checking Docker engine ..."
-if (-not (Test-DockerEngine)) {
-    $dockerCli = (Get-Command docker -ErrorAction Stop).Source
-    $dockerRoot = Split-Path (Split-Path (Split-Path $dockerCli -Parent) -Parent) -Parent
-    $candidates = @((Join-Path $dockerRoot "Docker Desktop.exe"))
-    if ($env:ProgramFiles) {
-        $candidates += Join-Path $env:ProgramFiles "Docker\Docker\Docker Desktop.exe"
-    }
-    $dockerDesktop = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if (-not $dockerDesktop) {
-        throw "Docker engine is unavailable and Docker Desktop.exe could not be located. Start Docker Desktop manually, then retry."
-    }
-
-    Write-Host "  Starting Docker Desktop: $dockerDesktop" -ForegroundColor Gray
-    Start-Process -FilePath $dockerDesktop | Out-Null
-
-    $engineReady = $false
-    $deadline = [DateTime]::Now.AddMinutes(3)
-    while ([DateTime]::Now -lt $deadline) {
-        Start-Sleep -Seconds 3
-        if (Test-DockerEngine) {
-            $engineReady = $true
-            break
+function Get-ManagedProcess([string]$Name) {
+    $recordPath = Get-RecordPath $Name
+    if (-not (Test-Path $recordPath)) { return $null }
+    try {
+        $record = Get-Content $recordPath -Raw | ConvertFrom-Json
+        $managedProcess = Get-Process -Id $record.processId -ErrorAction Stop
+        if ($managedProcess.StartTime.ToUniversalTime().Ticks -ne [long]$record.startTimeTicks) {
+            throw "PID start time does not match"
         }
-        Write-Host "  Waiting for Docker engine ..." -ForegroundColor Gray
+        return $managedProcess
     }
-    if (-not $engineReady) {
-        throw "Docker engine did not become ready within 3 minutes. Check Docker Desktop, then retry."
+    catch {
+        Remove-Item $recordPath -Force -ErrorAction SilentlyContinue
+        return $null
     }
 }
-Write-OK "Docker engine is ready"
 
-Write-Step "Starting PostgreSQL + pgvector ..."
-docker compose -f "$ComposeFile" up -d
-Assert-NativeSuccess "docker compose up failed"
-
-Write-Host "  Waiting for PostgreSQL ..." -ForegroundColor Gray
-$databaseReady = $false
-$deadline = [DateTime]::Now.AddSeconds(90)
-while ([DateTime]::Now -lt $deadline) {
-    docker exec $ContainerName pg_isready -U postgres -d github_knowledge_hub *> $null
-    if ($LASTEXITCODE -eq 0) {
-        $databaseReady = $true
-        break
+function Start-ManagedProcess([string]$Name, [string[]]$Arguments) {
+    $stdoutPath = Join-Path $LogDir "$Name.log"
+    $stderrPath = Join-Path $LogDir "$Name.error.log"
+    $npm = (Get-Command npm.cmd -ErrorAction Stop).Source
+    $managedProcess = Start-Process -FilePath $npm -ArgumentList $Arguments `
+        -WorkingDirectory $ProjectRoot -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+    $record = @{
+        processId = $managedProcess.Id
+        startTimeTicks = $managedProcess.StartTime.ToUniversalTime().Ticks.ToString()
+        name = $Name
+        stdout = $stdoutPath
+        stderr = $stderrPath
     }
-    Start-Sleep -Seconds 2
-}
-if (-not $databaseReady) {
-    throw "PostgreSQL did not become ready within 90 seconds. Run 'docker logs $ContainerName' for details."
+    $record | ConvertTo-Json | Set-Content -Path (Get-RecordPath $Name) -Encoding UTF8
+    $script:StartedProcesses += $Name
+    Write-OK "$Name started (PID $($managedProcess.Id))"
+    return $managedProcess
 }
 
-docker exec $ContainerName psql -U postgres -d github_knowledge_hub -c "CREATE EXTENSION IF NOT EXISTS vector;"
-Assert-NativeSuccess "Failed to enable the pgvector extension"
-Write-OK "PostgreSQL and pgvector are ready"
+function Stop-ProcessTree([int]$ProcessId) {
+    $children = Get-CimInstance Win32_Process -Filter "ParentProcessId = $ProcessId" -ErrorAction SilentlyContinue
+    foreach ($child in $children) { Stop-ProcessTree $child.ProcessId }
+    Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+}
 
-Push-Location $ProjectRoot
+function Stop-ManagedProcess([string]$Name) {
+    $managedProcess = Get-ManagedProcess $Name
+    if ($managedProcess) {
+        Stop-ProcessTree $managedProcess.Id
+        Write-OK "$Name stopped"
+    }
+    Remove-Item (Get-RecordPath $Name) -Force -ErrorAction SilentlyContinue
+}
+
+$mutex = New-Object System.Threading.Mutex($false, "Local\GitHubKnowledgeHubDesktopLauncher")
+$mutexHeld = $false
 try {
-    Write-Step "Validating and synchronizing Prisma ..."
-    npx.cmd prisma validate
-    Assert-NativeSuccess "prisma validate failed"
-    npx.cmd prisma db push
-    Assert-NativeSuccess "prisma db push failed"
-    Write-OK "Prisma is ready"
+    if (-not $mutex.WaitOne([TimeSpan]::FromSeconds(30))) {
+        throw "Another launcher is still running; retry after it finishes"
+    }
+    $mutexHeld = $true
 
-    if (-not $NoBrowser) {
-        $BrowserJob = Start-Job -ScriptBlock {
-            param($Url)
-            for ($attempt = 0; $attempt -lt 90; $attempt++) {
-                try {
-                    $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 2
-                    if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) {
-                        Start-Process -FilePath $Url
-                        return
-                    }
-                }
-                catch {
-                    # The development server may still be compiling; retry until timeout.
+    Write-Host "====================================================" -ForegroundColor Cyan
+    Write-Host "  GitHub Knowledge Hub -- Docker Desktop Launcher" -ForegroundColor Cyan
+    Write-Host "===================================================="
+
+    foreach ($commandName in @("docker", "npx.cmd", "npm.cmd")) {
+        if (-not (Get-Command $commandName -ErrorAction SilentlyContinue)) {
+            throw "Required command not found: $commandName"
+        }
+    }
+    if (-not (Test-Path $ComposeFile)) { throw "Compose file not found: $ComposeFile" }
+
+    Write-Step "Checking existing Web and Worker instances ..."
+    $webProcess = Get-ManagedProcess "web"
+    $workerProcess = Get-ManagedProcess "worker"
+    $webReachable = Test-App
+    $useExistingWeb = $webReachable -and -not $webProcess
+
+    if ($webReachable -and $workerProcess) {
+        Write-OK "Web and Worker are already running; no duplicates started"
+        if (-not $NoBrowser -and -not $SmokeTest) { Start-Process -FilePath $AppUrl }
+        return
+    }
+    if ($useExistingWeb) { Write-OK "Using the existing Web instance at $AppUrl" }
+    if ($workerProcess) { Write-OK "Worker is already running (PID $($workerProcess.Id))" }
+
+    if (-not $webProcess -and -not $useExistingWeb) {
+        $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+        if ($listener) {
+            $occupyingPid = ($listener | Select-Object -First 1).OwningProcess
+            throw "Port $Port is occupied by PID $occupyingPid, but $AppUrl is unavailable"
+        }
+    }
+
+    Write-Step "Checking Docker engine ..."
+    if (-not (Test-DockerEngine)) {
+        $candidates = @()
+        if ($env:ProgramFiles) { $candidates += Join-Path $env:ProgramFiles "Docker\Docker\Docker Desktop.exe" }
+        $dockerDesktop = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+        if (-not $dockerDesktop) { throw "Docker engine is unavailable; start Docker Desktop manually" }
+        Start-Process -FilePath $dockerDesktop | Out-Null
+        $engineReady = $false
+        $deadline = [DateTime]::Now.AddMinutes(3)
+        while ([DateTime]::Now -lt $deadline) {
+            Start-Sleep -Seconds 3
+            if (Test-DockerEngine) { $engineReady = $true; break }
+        }
+        if (-not $engineReady) { throw "Docker engine did not become ready within 3 minutes" }
+    }
+    Write-OK "Docker engine is ready"
+
+    Write-Step "Starting PostgreSQL and checking readiness ..."
+    docker compose -f "$ComposeFile" up -d
+    Assert-NativeSuccess "docker compose up failed"
+    $databaseReady = $false
+    $deadline = [DateTime]::Now.AddSeconds(90)
+    while ([DateTime]::Now -lt $deadline) {
+        docker exec $ContainerName pg_isready -U postgres -d github_knowledge_hub *> $null
+        if ($LASTEXITCODE -eq 0) { $databaseReady = $true; break }
+        Start-Sleep -Seconds 2
+    }
+    if (-not $databaseReady) { throw "PostgreSQL did not become ready within 90 seconds" }
+    Write-OK "PostgreSQL is ready"
+
+    Push-Location $ProjectRoot
+    try {
+        Write-Step "Validating Prisma and migration status (read-only) ..."
+        npx.cmd prisma validate
+        Assert-NativeSuccess "prisma validate failed"
+        npx.cmd prisma migrate status
+        Assert-NativeSuccess "Database migrations are not up to date; run npm run db:deploy after reviewing the maintenance guide"
+        Write-OK "Prisma schema and migrations are valid; no schema changes were made"
+
+        if (-not $workerProcess) {
+            Write-Step "Starting analysis Worker ..."
+            $workerProcess = Start-ManagedProcess "worker" @("run", "worker")
+            Start-Sleep -Seconds 2
+            $workerProcess.Refresh()
+            if ($workerProcess.HasExited) { throw "Worker exited during startup; inspect $LogDir\worker.error.log" }
+        }
+
+        if (-not $webProcess -and -not $useExistingWeb) {
+            Write-Step "Starting Next.js development server ..."
+            $webProcess = Start-ManagedProcess "web" @("run", "dev", "--", "--port", $Port.ToString())
+        }
+
+        if (-not $webReachable) {
+            $deadline = [DateTime]::Now.AddSeconds(90)
+            while ([DateTime]::Now -lt $deadline) {
+                if (Test-App) { $webReachable = $true; break }
+                if ($webProcess) {
+                    $webProcess.Refresh()
+                    if ($webProcess.HasExited) { throw "Next.js exited during startup; inspect $LogDir\web.error.log" }
                 }
                 Start-Sleep -Seconds 1
             }
-        } -ArgumentList $AppUrl
-    }
+        }
+        if (-not $webReachable) { throw "Next.js did not become reachable at $AppUrl within 90 seconds" }
 
-    Write-Step "Starting Next.js development server ..."
-    Write-Host "  URL: $AppUrl" -ForegroundColor Cyan
-    Write-Host "  Press Ctrl+C to stop Next.js. PostgreSQL will remain running." -ForegroundColor Gray
-    npm.cmd run dev
+        $workerProcess.Refresh()
+        if ($workerProcess.HasExited) { throw "Worker stopped during startup; inspect $LogDir\worker.error.log" }
+        Write-OK "Web is reachable at $AppUrl and Worker is running"
+        Write-Host "  Web log:    $(Join-Path $LogDir 'web.log')" -ForegroundColor Gray
+        Write-Host "  Worker log: $(Join-Path $LogDir 'worker.log')" -ForegroundColor Gray
+
+        if ($SmokeTest) {
+            Write-OK "Smoke test passed; only newly started processes will be stopped"
+        }
+        else {
+            if (-not $NoBrowser) { Start-Process -FilePath $AppUrl }
+            Write-Host "  Stop with: npm run dev:desktop:stop" -ForegroundColor Gray
+        }
+    }
+    finally { Pop-Location }
+}
+catch {
+    $ExitCode = 1
+    Write-Host "`nStartup failed: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Review logs in $LogDir. No unrelated process was stopped." -ForegroundColor Gray
 }
 finally {
-    if ($BrowserJob) {
-        Remove-Job -Job $BrowserJob -Force -ErrorAction SilentlyContinue
+    if ($SmokeTest -or $ExitCode -ne 0) {
+        foreach ($name in ($StartedProcesses | Sort-Object -Descending)) { Stop-ManagedProcess $name }
     }
-    Pop-Location
+    if ($mutexHeld) { $mutex.ReleaseMutex() }
+    $mutex.Dispose()
 }
+if ($ExitCode -ne 0) { exit $ExitCode }

@@ -2,7 +2,15 @@
 
 > 基线日期：2026-11-03  
 > 原则：先保证可恢复、可迁移、可验证，再扩展 AI 和分享功能。  
-> 状态口径：“现状”描述任务开始时的代码/环境，不代表后续任务已经完成。
+> 状态口径：各节“现状”保留任务起点；完成状态以 2026-11-03 P0 快照和实际验证为准。
+
+## 2026-11-03 P0 完成快照
+
+- P0-1：Git 历史和 GitHub Private 远程备份已建立，普通非强制推送。
+- P0-2：完整数据库备份、隔离恢复、真实备份副本无损升级和真实 migration 均完成；generated stored `searchVector` + GIN 正常。
+- P0-3：新环境 `migrate deploy` 与旧 `db push` 环境 baseline 均有版本化 migration 和隔离测试；真实库 migration status 为 up to date，Prisma drift 为空。
+- P0-4：8 个单元测试、13 个隔离集成测试通过；真实桌面 Web+Worker HTTP 200，重复启动不产生重复进程。
+- 真实 OAuth、真实 LLM/Embedding、完整资产提取链和更多业务领域回归仍未重验；CI、Token 加密和 Worker 原子领取属于后续 P1。
 
 ## 优先级定义
 
@@ -12,9 +20,11 @@
 
 ---
 
-## P0：必须先完成
+## P0：已完成（本轮约定范围）
 
 ### P0-1 Git 版本管理和仓库备份
+
+**完成状态：已完成；Commit 与远程 SHA 按每次推送单独核对。**
 
 **现状**
 
@@ -44,6 +54,8 @@
 - 全程没有 force push、覆盖不相关仓库或删除历史。
 
 ### P0-2 PostgreSQL 全文搜索 generated column / GIN 修复
+
+**完成状态：已完成；真实库 219 个 Repository 无损，三模式搜索在隔离库通过。**
 
 **现状**
 
@@ -76,6 +88,8 @@
 
 ### P0-3 Prisma migration 管理方案
 
+**完成状态：已完成；初始基线、search 增量、baseline 安全检查和启动只读检查均已落地。**
+
 **现状**
 
 - 项目主要依赖 `prisma db push`。
@@ -104,6 +118,8 @@
 - migration SQL 进入 Git，CI 可在 PostgreSQL/pgvector 测试服务上重复执行。
 
 ### P0-4 项目启动与核心功能 smoke test
+
+**完成状态：本轮 migration/search/Worker/startup 范围完成；更多领域测试与 CI 在 P1 继续。**
 
 **现状**
 
@@ -193,8 +209,8 @@
 
 **现状**
 
-- 无 test 脚本、未发现业务测试文件、无 GitHub Actions。
-- TypeScript 和 Prisma validate 可运行，但缺乏统一质量门。
+- 已有 Vitest 单元测试和隔离 PostgreSQL 集成测试，但无 GitHub Actions。
+- TypeScript、Prisma validate、ESLint、test 和 build 可本地运行，尚缺统一远程质量门。
 
 **问题**
 
@@ -218,7 +234,7 @@
 
 **现状**
 
-- README 的 Phase 状态落后于源码。
+- README 与三份维护文档已同步 P0；`.env.example`、源码 TODO 和 Phase 注释仍需继续清理。
 - `.env.example` 仍写 Phase 5 未启用，部分变量说明与代码读取不一致。
 - `src/lib/openai.ts` 仍有 stub 注释。
 - 项目 `CLAUDE.md` 引用不存在的 `PROJECT_BRIEF.md` 和旧 Harness 路线。
@@ -289,11 +305,11 @@
 
 ## 推荐实施顺序
 
-1. Git/安全备份与敏感信息审计。
-2. 在测试库修复全文搜索和 Prisma migration 基线。
-3. 建立启动及核心 smoke test。
+1. ~~Git/安全备份与敏感信息审计~~（已完成，提交前持续复查）。
+2. ~~全文搜索和 Prisma migration 基线~~（已完成）。
+3. ~~本轮启动及核心 smoke test~~（已完成）。
 4. Token 加密与 Worker 原子领取。
-5. CI 和文档一致性。
+5. CI 和剩余文档/环境模板一致性。
 6. difficulty、遥测、收藏集和统一摘要链。
 
 ## 每项任务的完成定义

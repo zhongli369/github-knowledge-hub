@@ -1,7 +1,7 @@
 # GitHub Knowledge Hub 项目维护指南
 
 > 整理日期：2026-11-03  
-> 依据：当前工作区源码、配置、数据库只读检查及本地启动验证。  
+> 依据：当前源码、隔离测试、真实备份恢复演练、真实 migration 与本地启动验证。
 > 本文用于长期维护，不代表所有功能均已在整理当日重新完成端到端验收。
 
 ## 1. 项目定位
@@ -18,20 +18,29 @@ GitHub Knowledge Hub 是一个个人 GitHub 知识管理工作台，核心链路
 
 “源码已实现”表示页面、Server Action、服务或 Worker 调用链在代码中存在并相互连接，不等于当前环境已完成真实外部服务验收。
 
-### 2.2 整理当日实际验证
+### 2.2 P0 修复后的实际验证（2026-11-03）
 
-- Windows 桌面快捷方式成功启动 Docker Desktop、PostgreSQL 和 Next.js。
-- `http://localhost:3000/` 返回 HTTP 200，并跳转 `/login?callbackUrl=%2F`。
-- TypeScript `--noEmit` 类型检查通过。
-- 在项目根目录执行 `prisma validate` 通过。
-- `npm run lint` 通过；保留 `analysis.service.ts` 中 `_opts` 未使用的 1 条 warning，以及 `next lint` 将在 Next.js 16 移除的弃用提示。
-- 使用 staged 文件、独立临时目录和非生产哑配置执行 `next build` 成功，完成编译、类型检查和 11 个静态页面生成；未读取真实 `.env`，未连接真实数据库。
-- 6 个 staged Markdown 文件的 7 个相对链接目标均存在；2 个 flowchart、1 个 ER 图和 3 个 sequenceDiagram 共 6 个 Mermaid 块均通过 Mermaid 11 本地解析。
-- 项目没有 `test` 脚本和已发现的业务自动化测试，因此没有可报告的测试通过数量。
-- Docker PostgreSQL 容器运行，`5432` 端口映射正常，pgvector 扩展存在。
-- 对当前 Docker 数据库进行了只读检查，发现全文搜索列和索引不符合手写迁移的设计，详见 P0 技术债。
+**真实数据库备份与迁移**
 
-### 2.3 整理当日未重新端到端验证
+- 真实库审计：PostgreSQL 17.11、pgvector 0.8.7、11 张业务表、219 个 Repository；迁移前 `searchVector` 全为 NULL、无视图等依赖，表约 120 kB。
+- 完整 custom-format 备份：`db-backups/gkh-p0-20261103-230915.dump`，68,203 bytes，SHA-256 `21f7f6efb686386cfe563f93e09a4ea344812685e6fa41b3098fd2973ba0e8f4`。`pg_restore --list` 和隔离恢复成功；11 张表记录数、内容哈希及结构指纹全部一致。
+- 在另一份真实备份恢复库完成 baseline + 增量 migration；排除派生 `searchVector` 后，11 张表内容哈希不变，其他列、索引、约束、扩展和函数指纹不变。自动更新测试在事务内通过后回滚。
+- **真实 Docker 数据库随后已执行相同 migration**，两条记录均成功；迁移前后业务内容哈希不变。真实只读检查确认 generated stored column、GIN、0 个 NULL searchVector、keyword 命中及空 Prisma drift，`prisma migrate status` 为 up to date。
+
+**隔离自动化与静态验证**
+
+- `npm test`：2 个文件、8 个单元测试通过，覆盖 Worker 状态分支、异常释放和启动脚本安全约束；GitHub/LLM 均 Mock。
+- `npm run test:integration`：3 个文件、13 个测试通过。覆盖空库 `migrate deploy`、旧 `db push` 库 baseline、数据保留、1536 维向量、generated/GIN、migration 后空 Prisma diff、keyword/semantic/hybrid、筛选、用户隔离、空结果、异常输入、自动维护和真实 Web+Worker 启动/停止。
+- 集成测试只创建并清理唯一 `gkh_test_*` 数据库；semantic/hybrid 使用确定性 1536 维向量和 Mock provider，没有调用付费 API。
+- `npm run typecheck`、`npx prisma validate`、`npm run build` 通过；生产构建生成 11 个静态页面。
+- `npm run lint` 无错误，保留原有 `analysis.service.ts:531` 的 1 个未使用参数 warning。
+
+**真实桌面进程**
+
+- `scripts/start-desktop.ps1` 在真实 migration 状态下启动 Web 和 Worker；`http://localhost:3000` 返回 HTTP 200。
+- 第二次启动保留相同 Web/Worker PID，没有重复实例；Worker 显示 started，Web/Worker 错误日志均为空。两个 Analysis 均为 completed，启动时未领取真实任务。
+
+### 2.3 尚未完成的真实端到端验证
 
 - GitHub OAuth 完整登录回调。
 - 我的仓库/Starred 仓库真实同步。
@@ -103,7 +112,8 @@ GitHub Knowledge Hub 是一个个人 GitHub 知识管理工作台，核心链路
 | UI | Tailwind 4.3、shadcn/ui、Radix/Base UI | 页面与组件系统 |
 | UI 辅助 | Lucide、next-themes、sonner、react-markdown、SWR | 图标、主题、通知、Markdown、数据请求 |
 | Worker | tsx 4.22.3 | 直接运行 TypeScript Worker |
-| 进程编排 | concurrently 9.2.1 | `dev:all` 同时运行 Web/Worker |
+| 进程编排 | concurrently 9.2.1、PowerShell | `dev:all` 前台运行；桌面 PID/日志管理 |
+| 测试 | Vitest 3.2.4 | 单元测试与隔离 PostgreSQL 集成测试 |
 
 Embedding 模型和维度当前硬编码为 `text-embedding-3-small`、1536 维。更换不同维度模型必须同步修改服务和数据库 vector 类型。
 
@@ -246,7 +256,7 @@ User
 - `RepoEmbedding`：保存仓库向量及 `textHash`，用于新鲜度判断。
 - `CollectionAsset`：Collection 与 KnowledgeAsset 的多对多连接表。
 
-schema 入口：`prisma/schema.prisma`。手写全文搜索 SQL：`prisma/migrations/hybrid-search.sql`。
+schema 入口：`prisma/schema.prisma`。migration 入口：`prisma/migrations/20261103230000_init/` 与 `20261103231000_repository_search_vector/`。`searchVector` 在 Prisma 中声明为 `@default(dbgenerated())` 和 GIN index，实际 generated 表达式由 SQL migration 管理。
 
 ## 8. Windows + Docker 本地部署
 
@@ -254,28 +264,37 @@ schema 入口：`prisma/schema.prisma`。手写全文搜索 SQL：`prisma/migrat
 
 Docker Compose 只运行 PostgreSQL；Next.js 和 Worker 直接运行在 Windows Node.js 主机。Docker Volume `pgdata` 持久化数据库。
 
-### 8.2 手动启动
+### 8.2 数据库初始化、baseline 与手动启动
+
+**全新数据库：**
 
 ```bash
 cd F:\Claude\ClaudeCodeProject\GithubKnowledgeHub
-
 docker compose up -d
-npx prisma validate
-
-# 仅在明确需要同步 schema、且已评估数据库变更时执行：
-# npx prisma db push
-
+npm run db:deploy
 npm run dev:all
 ```
 
-`dev:all` 同时运行 Web 与 Worker。也可分开：
+`db:deploy` 应用完整初始 migration 和 searchVector 增量 migration，并检查 generated/GIN/migration 历史。新环境不需要 `db push`。
+
+**既有 `db push` 数据库：** 必须先备份、隔离恢复并审查差异。以下命令不得对未核实的非空库直接执行：
 
 ```bash
-npm run dev
-npm run worker
+npm run db:baseline       # dry-run；不写 migration 历史
+npm run db:baseline:apply # 显式应用 baseline + 增量 migration
 ```
 
-**维护时禁止把 `db push` 当作无风险的启动命令；已有数据环境应先审查 migration 和备份。**
+baseline 脚本会拒绝：已有 `_prisma_migrations`、非普通 `searchVector`、既有 search GIN、或除待建 GIN 外的 Prisma schema 差异。只有检查通过才会 `migrate resolve --applied 20261103230000_init`，随后 `migrate deploy`。若增量阶段失败，修复后使用 `npm run db:deploy`，不要重复 baseline。
+
+**当前真实 Docker 数据库已完成此过程，后续只需：**
+
+```bash
+npm run db:deploy
+npx prisma migrate status
+npm run dev:all
+```
+
+也可分别运行 `npm run dev` 和 `npm run worker`。日常启动不属于 schema 维护操作，禁止重新加入 `db push` 或自动 `migrate deploy`。
 
 ### 8.3 桌面快捷方式
 
@@ -287,19 +306,20 @@ powershell.exe -NoLogo -NoExit -ExecutionPolicy Bypass -File "F:\Claude\ClaudeCo
 
 脚本职责：
 
-1. 检查 3000 端口，已可访问时直接打开页面。
-2. 检查并按安装路径启动 Docker Desktop。
-3. 启动 Compose PostgreSQL，等待 `pg_isready`。
-4. 创建 pgvector 扩展、执行 Prisma 检查和 schema 同步。
-5. 启动 Next.js，页面可访问后打开浏览器。
+1. 用启动互斥锁、PID + 进程 StartTime 记录避免重复 Web/Worker；PID 重用不会被当作同一进程。
+2. 检查并按安装路径启动 Docker Desktop，启动 Compose PostgreSQL，等待 `pg_isready`。
+3. 只执行 `prisma validate` 和只读 `prisma migrate status`；不创建扩展、不 `db push`、不自动 deploy。
+4. 后台启动 Worker 和 Next.js，检查 Worker 早期退出并等待 Web HTTP 可用。
+5. 分别写入 `.run/web.json`、`.run/worker.json` 与 `logs/web*.log`、`logs/worker*.log`；页面可用后打开浏览器。
 
-整理时该脚本只运行 `npm run dev`，**不会启动 Worker**。需要资产提取时另开终端：
+管理命令：
 
 ```bash
-npm run worker
+npm run dev:desktop
+npm run dev:desktop:stop
 ```
 
-否则 `asset_extraction` 会停留在 `pending`。后续宜将桌面启动链改为显式可选择 Web-only 或 Web+Worker，并移除启动时的自动数据库写操作。
+停止脚本只停止 PID/StartTime 均匹配的本项目进程，不停止 PostgreSQL 或无关进程。启动失败时查看 `logs/web.error.log` 和 `logs/worker.error.log`。`asset_extraction` 依赖 Worker；桌面路线默认已同时启动两者。
 
 ### 8.4 WSL 旧路线
 
@@ -333,20 +353,20 @@ WSL PostgreSQL 与 Docker Volume 是不同数据存储，切换时不会自动�
 
 ## 10. 已知问题与技术债
 
-### P0：优先恢复可维护性和可验证性
+### P0：已完成（2026-11-03）
 
-1. **Git 与备份**：整理前目录未初始化 Git，缺少版本历史和远程备份。
-2. **全文搜索数据库状态错误**：当前 Docker 数据库只读检查显示 pgvector 存在，但 `searchVector` 为普通 `tsvector`、`generated=NEVER`，GIN 索引不存在。
-3. **迁移流程不完整**：主要使用 `db push`，手写 SQL 与 Prisma schema 存在执行顺序和状态不一致；`prisma/migrations/` 曾被 `.gitignore` 忽略。
-4. **缺少 smoke test**：没有 test 脚本、测试文件和 CI，无法防止旧功能回归。
+1. **Git 与备份**：Private GitHub 仓库和普通推送已建立；数据库 custom-format 备份、隔离恢复及逐表哈希验证完成。
+2. **全文搜索**：真实库和隔离库均为 generated stored `searchVector` + GIN；name/description/topics 自动维护已验证。
+3. **migration 管理**：完整初始基线和增量 migration 已版本化；真实旧库经备份副本演练后 baseline。`@default(dbgenerated())` 与 Prisma GIN 声明消除了已发现的 generated/GIN drift。
+4. **启动与 smoke test**：桌面默认 Web+Worker、无 schema 写入；8 个单元测试和 13 个隔离集成测试通过。
 
-现有 `hybrid-search.sql` 使用 `ADD COLUMN IF NOT EXISTS`，对已存在的普通列重跑不会自动转换为 generated column，不能把“命令无报错”当作修复成功。
+旧 `hybrid-search.sql` 已删除。它使用 `ADD COLUMN IF NOT EXISTS`，无法转换既有普通列；其 `array_to_string()` 也不是 PostgreSQL 接受的 immutable generated expression。现 migration 使用仅限 `text[]` 的确定性 SQL wrapper `gkh_text_array_to_string`，并以隔离测试验证 topics 搜索。不得恢复旧手工 SQL 作为日常修复手段。
 
 ### P1：上线与长期维护前处理
 
 1. GitHub OAuth Token 写入加密链未接通，`encryptToken()` 未发现调用方，解密兼容明文。
 2. Worker 的“原子领取”实际为先 `findFirst` 再 `update`，多实例可能重复处理。
-3. 缺少自动化测试和 GitHub Actions。
+3. 已有本地单元/集成测试，仍缺少 GitHub Actions CI。
 4. README、`.env.example`、源码 TODO 和 Phase 状态存在漂移。
 5. 没有应用 Dockerfile、生产 Compose、反向代理和进程守护配置。
 
@@ -370,7 +390,7 @@ WSL PostgreSQL 与 Docker Volume 是不同数据存储，切换时不会自动�
 | 代码资产提取 | `src/services/knowledge/` |
 | 后台任务 | `workers/analysis-worker.ts` |
 | 数据模型 | `prisma/schema.prisma` |
-| 全文搜索 SQL | `prisma/migrations/hybrid-search.sql` |
+| 全文搜索 migration | `prisma/migrations/20261103231000_repository_search_vector/migration.sql` |
 | 本地启动 | `package.json`、`scripts/start-desktop.ps1` |
 | 中英文 | `src/i18n/` |
 
@@ -427,7 +447,33 @@ npx prisma validate
 
 不要把真实 `DATABASE_URL` 放进命令行、文档或 Git。
 
-## 13. 维护建议
+## 13. 备份与隔离恢复
+
+以下 PowerShell 示例把 custom-format dump 先写入容器，再用 `docker cp` 取回，避免 Windows PowerShell 文本重定向破坏二进制备份。备份包含 Account Token 等敏感内容，只能保存在受保护的本地目录；`db-backups/` 已被 Git 忽略。
+
+```powershell
+New-Item -ItemType Directory -Force db-backups | Out-Null
+$stamp = Get-Date -Format "yyyyMMddHHmmss"
+$dumpName = "gkh-$stamp.dump"
+docker exec github-knowledge-hub-db pg_dump -U postgres -d github_knowledge_hub --format=custom --encoding=UTF8 --file="/tmp/$dumpName"
+if ($LASTEXITCODE -ne 0) { throw "pg_dump failed" }
+docker cp "github-knowledge-hub-db:/tmp/$dumpName" ".\db-backups\$dumpName"
+docker exec github-knowledge-hub-db pg_restore --list "/tmp/$dumpName"
+if ($LASTEXITCODE -ne 0) { throw "Backup TOC validation failed" }
+```
+
+恢复到**唯一隔离数据库**，不要覆盖真实库，不使用 `--clean`：
+
+```powershell
+$restoreDb = "gkh_restore_$stamp"
+docker exec github-knowledge-hub-db createdb -U postgres $restoreDb
+docker exec github-knowledge-hub-db pg_restore -U postgres -d $restoreDb --exit-on-error --single-transaction "/tmp/$dumpName"
+if ($LASTEXITCODE -ne 0) { throw "Isolated restore failed" }
+```
+
+恢复成功仍不代表数据等价；必须继续比较所有业务表的记录数、内容哈希及列/索引/约束/扩展。migration 演练还应排除派生 `searchVector` 比较业务字段，并确认差异仅限预期对象。隔离库清理前逐一核对 `datname`，禁止删除 Volume 或对真实库执行 reset。
+
+## 14. 维护建议
 
 1. 先建立可恢复的 Git/数据库备份，再做 migration 和业务修改。
 2. 数据库验证使用独立测试实例，不在个人真实数据上试验迁移。
