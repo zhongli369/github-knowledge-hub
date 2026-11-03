@@ -1,0 +1,91 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+!.pnp.cjs
+!.pnp.js
+!.pnp.loader.mjs
+.yarn/*
+!.yarn/patches
+!.yarn/cache
+!.yarn/unplugged
+!.yarn/build-state.yml
+!.yarn/install-state.gz
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+
+# Next.js and production builds
+/.next/
+/out/
+/build/
+/dist/
+
+# test and coverage
+/coverage/
+/.nyc_output/
+
+# caches
+/.cache/
+/.turbo/
+/.parcel-cache/
+*.tsbuildinfo
+next-env.d.ts
+
+# logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# real environment files and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# database data, dumps and backups
+/pgdata/
+/postgres-data/
+/docker-data/
+/db-backups/
+/backups/
+*.dump
+*.backup
+*.sqlite
+*.sqlite3
+*.db
+
+# local backups and temporary files
+*.bak
+*.bak_*
+*.old
+*.orig
+*.rej
+*.tmp
+*.temp
+/tmp/
+/temp/
+/.tmp/
+
+# local AI tooling, editors and OS files
+/.claude/
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# deployment platforms
+.vercel
+
+# Prisma migrations must be versioned, including hand-written SQL.
+!prisma/migrations/
+!prisma/migrations/**

@@ -1,0 +1,199 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pgvector(map: "vector", schema: "public")]
+}
+
+// ── Auth.js Tables ──────────────────────────────────────────────
+
+model User {
+  id             String         @id @default(cuid())
+  name           String?
+  email          String?        @unique
+  emailVerified  DateTime?
+  image          String?
+  githubUsername String?        @unique
+  accounts       Account[]
+  sessions       Session[]
+  repositories   Repository[]
+  analyses       Analysis[]
+  collections    Collection[]
+  knowledgeAssets KnowledgeAsset[]
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ── Domain Tables ───────────────────────────────────────────────
+
+model Repository {
+  id              String           @id @default(cuid())
+  githubId        Int              @unique
+  owner           String
+  name            String
+  fullName        String           @unique
+  description     String?
+  url             String
+  homepage        String?
+  language        String?
+  stars           Int              @default(0)
+  forks           Int              @default(0)
+  topics          String[]
+  defaultBranch   String           @default("main")
+  isArchived      Boolean          @default(false)
+  isTemplate      Boolean          @default(false)
+  license         String?
+  size            Int              @default(0)
+  pushedAt        DateTime?
+  lastFetchedAt   DateTime         @default(now())
+  note            String?
+  status          String           @default("new") // "new", "analyzing", "active", "archived"
+  userId          String
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  knowledgeAssets KnowledgeAsset[]
+  analyses        Analysis[]
+  repoEmbedding   RepoEmbedding?
+  searchVector    Unsupported("tsvector")?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  @@index([userId])
+  @@index([language])
+  @@index([stars])
+}
+
+model KnowledgeAsset {
+  id            String    @id @default(cuid())
+  title         String
+  description   String?
+  assetType     String    // "algorithm", "pattern", "snippet", "architecture", "config", "doc"
+  sourcePath    String?   // file path within the repo
+  sourceUrl     String?
+  content       String    // extracted source text
+  summary       String?   // LLM-generated summary
+  language      String?
+  tags          String[]
+  difficulty    String?   // "beginner", "intermediate", "advanced"
+  usefulness    Int       @default(0)
+  repositoryId  String
+  repository    Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  embedding     Embedding?
+  collections   CollectionAsset[]
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@unique([repositoryId, sourcePath])
+  @@index([userId])
+  @@index([repositoryId])
+  @@index([assetType])
+  @@index([language])
+}
+
+model Embedding {
+  id               String         @id @default(cuid())
+  assetId          String         @unique
+  asset            KnowledgeAsset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  vector           Unsupported("vector(1536)")
+  model            String         @default("text-embedding-3-small")
+  createdAt        DateTime       @default(now())
+}
+
+model RepoEmbedding {
+  id           String     @id @default(cuid())
+  repositoryId String     @unique
+  repository   Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  vector       Unsupported("vector(1536)")
+  model        String     @default("text-embedding-3-small")
+  textHash     String     // SHA256 of source text for change detection
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+}
+
+model Collection {
+  id          String            @id @default(cuid())
+  name        String
+  description String?
+  isPublic    Boolean           @default(false)
+  userId      String
+  user        User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  assets      CollectionAsset[]
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  @@index([userId])
+}
+
+model CollectionAsset {
+  id           String          @id @default(cuid())
+  collectionId String
+  assetId      String
+  addedAt      DateTime        @default(now())
+  sortOrder    Int             @default(0)
+  collection   Collection      @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+  asset        KnowledgeAsset  @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@unique([collectionId, assetId])
+}
+
+model Analysis {
+  id              String         @id @default(cuid())
+  analysisType    String         // "repo_summary", "code_review", "pattern_extraction", "dependency_analysis", "similarity_search"
+  status          String         @default("pending") // "pending", "running", "completed", "failed"
+  input           Json?
+  result          Json?
+  error           String?
+  model           String?        // LLM model used
+  tokensUsed      Int            @default(0)
+  durationMs      Int            @default(0)
+  repositoryId    String?
+  repository      Repository?    @relation(fields: [repositoryId], references: [id], onDelete: SetNull)
+  userId          String
+  user            User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  similarAssetIds String[]       @default([])
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([analysisType])
+}
