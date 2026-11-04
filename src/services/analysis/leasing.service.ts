@@ -17,6 +17,13 @@
  * claim predicate nor `failAnalysis` will ever let `attempts` exceed a hard
  * ceiling without reaching the terminal `failed` state, so a poisoned task
  * cannot loop forever.
+ *
+ * Monotonic fencing: `attempts` doubles as a fencing token. A claim returns
+ * the post-increment `attempts` value; every lease operation can carry it back
+ * as `fencingToken` and the UPDATE condition includes `"attempts" = <token>`.
+ * Because every reclaim increments `attempts`, a stale worker can no longer
+ * renew, complete, or fail a task that was reclaimed — even if `workerId` were
+ * somehow recycled — so a newer worker's result can never be overwritten.
  */
 
 import os from "node:os"
@@ -74,12 +81,17 @@ export function createWorkerId(): string {
  * Atomically claim the oldest claimable task.
  *
  * A task is claimable when it is `pending` (with headroom below maxAttempts) or
- * when it is `running` with an expired lease. If a claimable `running` row has
- * already reached `maxAttempts` (e.g. a worker crashed after its final claim),
- * the row is converted to terminal `failed` here rather than re-leased, which
- * is what guarantees the "no infinite loop" property.
+ * when it is `running` with an expired lease — or a `running` row that has NO
+ * lease at all (crash between row creation and lease assignment, or a manual
+ * reset). If a claimable `running` row has already reached `maxAttempts` (e.g. a
+ * worker crashed after its final claim), the row is converted to terminal
+ * `failed` here rather than re-leased, which is what guarantees the
+ * "no infinite loop" property.
  *
- * Returns the claimed task, or `null` when nothing was claimable.
+ * Returns the claimed task, or `null` when nothing was claimable. The returned
+ * `attempts` value is the monotonically increasing fencing token the caller
+ * must carry into every later `renewLease` / `completeAnalysis` / `failAnalysis`
+ * call.
  */
 export async function claimNextAnalysis(options: ClaimOptions): Promise<ClaimableAnalysis | null> {
   const { workerId } = options
@@ -103,7 +115,8 @@ export async function claimNextAnalysis(options: ClaimOptions): Promise<Claimabl
      WHERE "id" IN (
        SELECT "id" FROM "Analysis"
        WHERE ("status" = 'pending' AND "attempts" < $4)
-          OR ("status" = 'running' AND "leaseExpiresAt" < $2)
+          OR ("status" = 'running'
+              AND ("leaseExpiresAt" IS NULL OR "leaseExpiresAt" < $2))
        ORDER BY "createdAt" ASC
        LIMIT 1
        FOR UPDATE SKIP LOCKED
@@ -149,15 +162,21 @@ export interface HeartbeatOptions {
   workerId: string
   now?: Date
   leaseDurationMs?: number
+  /** Monotonic fencing token captured at claim time (`attempts`). */
+  fencingToken?: number
 }
 
 /**
  * Renew the caller's lease. Succeeds only while the caller still owns the
- * task and the previous lease has not yet expired in the database.
+ * task and the previous lease has not yet expired in the database. When a
+ * `fencingToken` is supplied, renewal also requires the row to carry that exact
+ * `attempts` value, so a reclaimed task can never be renewed by its stale
+ * owner.
  */
 export async function renewLease(options: HeartbeatOptions): Promise<boolean> {
   const now = options.now ?? new Date()
   const renewedLease = new Date(now.getTime() + (options.leaseDurationMs ?? LEASE_DURATION_MS))
+  const fencing = options.fencingToken
 
   const affected = await prisma.$executeRawUnsafe(
     `UPDATE "Analysis"
@@ -165,11 +184,11 @@ export async function renewLease(options: HeartbeatOptions): Promise<boolean> {
      WHERE "id" = $1
        AND "workerId" = $2
        AND "status" = 'running'
-       AND "leaseExpiresAt" > $4`,
-    options.analysisId,
-    options.workerId,
-    renewedLease,
-    now,
+       AND "leaseExpiresAt" > $4
+       ${fencing == null ? "" : 'AND "attempts" = $5'}`,
+    ...(fencing == null
+      ? [options.analysisId, options.workerId, renewedLease, now]
+      : [options.analysisId, options.workerId, renewedLease, now, fencing]),
   )
   return affected > 0
 }
@@ -183,16 +202,22 @@ export interface CompleteOptions {
   model?: string
   tokensUsed?: number
   durationMs?: number
+  /** Monotonic fencing token captured at claim time (`attempts`). */
+  fencingToken?: number
 }
 
 /**
  * Mark a task completed. The UPDATE is conditional on the caller still owning
  * the task (`workerId`) and holding a valid lease (`leaseExpiresAt > now`), so
- * a stale worker can never clobber the result written by a newer worker.
+ * a stale worker can never clobber the result written by a newer worker. When a
+ * `fencingToken` is supplied, the row must also carry that exact `attempts`
+ * value — a reclaimed task (which has a higher `attempts`) is rejected even if
+ * `workerId` were somehow reused.
  */
 export async function completeAnalysis(options: CompleteOptions): Promise<boolean> {
   const now = options.now ?? new Date()
   const resultJson = options.result == null ? null : JSON.stringify(options.result)
+  const fencing = options.fencingToken
 
   const affected = await prisma.$executeRawUnsafe(
     `UPDATE "Analysis"
@@ -207,15 +232,11 @@ export async function completeAnalysis(options: CompleteOptions): Promise<boolea
      WHERE "id" = $1
        AND "workerId" = $2
        AND "status" = 'running'
-       AND "leaseExpiresAt" > $3`,
-    options.analysisId,
-    options.workerId,
-    now,
-    options.status ?? "completed",
-    resultJson,
-    options.model ?? null,
-    options.tokensUsed ?? null,
-    options.durationMs ?? null,
+       AND "leaseExpiresAt" > $3
+       ${fencing == null ? "" : 'AND "attempts" = $9'}`,
+    ...(fencing == null
+      ? [options.analysisId, options.workerId, now, options.status ?? "completed", resultJson, options.model ?? null, options.tokensUsed ?? null, options.durationMs ?? null]
+      : [options.analysisId, options.workerId, now, options.status ?? "completed", resultJson, options.model ?? null, options.tokensUsed ?? null, options.durationMs ?? null, fencing]),
   )
   return affected > 0
 }
@@ -229,17 +250,21 @@ export interface FailOptions {
   /** Persist measured cost/latency so failed tasks are still observable. */
   durationMs?: number
   tokensUsed?: number
+  /** Monotonic fencing token captured at claim time (`attempts`). */
+  fencingToken?: number
 }
 
 /**
  * Conditional failure. When `attempts` has reached `maxAttempts` the task is
  * terminally `failed`; otherwise it is released back to `pending` so another
  * worker (with remaining budget) can retry. Fails (returns false) silently
- * when the caller no longer owns a valid lease.
+ * when the caller no longer owns a valid lease — including when a supplied
+ * `fencingToken` no longer matches the reclaimed row's `attempts`.
  */
 export async function failAnalysis(options: FailOptions): Promise<boolean> {
   const now = options.now ?? new Date()
   const maxAttempts = options.maxAttempts ?? MAX_ATTEMPTS
+  const fencing = options.fencingToken
 
   const affected = await prisma.$executeRawUnsafe(
     `UPDATE "Analysis"
@@ -255,14 +280,11 @@ export async function failAnalysis(options: FailOptions): Promise<boolean> {
      WHERE "id" = $1
        AND "workerId" = $2
        AND "status" = 'running'
-       AND "leaseExpiresAt" > $3`,
-    options.analysisId,
-    options.workerId,
-    now,
-    options.error.slice(0, 1000),
-    maxAttempts,
-    options.tokensUsed ?? null,
-    options.durationMs ?? null,
+       AND "leaseExpiresAt" > $3
+       ${fencing == null ? "" : 'AND "attempts" = $8'}`,
+    ...(fencing == null
+      ? [options.analysisId, options.workerId, now, options.error.slice(0, 1000), maxAttempts, options.tokensUsed ?? null, options.durationMs ?? null]
+      : [options.analysisId, options.workerId, now, options.error.slice(0, 1000), maxAttempts, options.tokensUsed ?? null, options.durationMs ?? null, fencing]),
   )
   return affected > 0
 }

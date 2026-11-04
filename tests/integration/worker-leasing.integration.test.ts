@@ -104,7 +104,7 @@ describe("PostgreSQL atomic worker claiming", () => {
 
   it("allows concurrent workers to claim distinct tasks", async () => {
     const id1 = await enqueue("repo_summary", `${DASH}-distinct-1`)
-    const id2 = await enqueue("repo_summary", `${DASH}-distinct-2`)
+    const id2 = await enqueue("asset_extraction", `${DASH}-distinct-2`)
 
     const [a, b] = await Promise.all([
       claimNextAnalysis({ workerId: "worker-a" }),
@@ -143,6 +143,17 @@ describe("PostgreSQL atomic worker claiming", () => {
     expect(row.workerId).toBe("worker-b")
     expect(row.attempts).toBe(2)
     expect(row.error).toBeNull()
+  })
+
+  it("reclaims a running task with no lease timestamp", async () => {
+    const id = await enqueue("repo_summary", `${DASH}-null-lease`)
+    await prisma.analysis.update({
+      where: { id },
+      data: { status: "running", workerId: "crashed-worker", leaseExpiresAt: null },
+    })
+
+    const reclaimed = await claimNextAnalysis({ workerId: "recovery-worker" })
+    expect(reclaimed).toMatchObject({ id, workerId: "recovery-worker", attempts: 1 })
   })
 
   it("terminally fails after max attempts and cannot loop forever", async () => {
@@ -233,6 +244,35 @@ describe("stale worker and lease renewal semantics", () => {
     const completed = await prisma.analysis.findUniqueOrThrow({ where: { id } })
     expect(completed.status).toBe("completed")
     expect(completed.result).toEqual({ summary: "fresh result" })
+  })
+
+  it("rejects an old fencing token even when the worker identity is reused", async () => {
+    const id = await enqueue("repo_summary", `${DASH}-fencing`)
+    const first = await claimNextAnalysis({ workerId: "reused-worker" })
+    await prisma.analysis.update({
+      where: { id },
+      data: { leaseExpiresAt: new Date(Date.now() - 1_000) },
+    })
+    const second = await claimNextAnalysis({ workerId: "reused-worker" })
+
+    expect(first!.attempts).toBe(1)
+    expect(second!.attempts).toBe(2)
+    expect(
+      await completeAnalysis({
+        analysisId: id,
+        workerId: "reused-worker",
+        fencingToken: first!.attempts,
+        result: { summary: "stale" },
+      }),
+    ).toBe(false)
+    expect(
+      await completeAnalysis({
+        analysisId: id,
+        workerId: "reused-worker",
+        fencingToken: second!.attempts,
+        result: { summary: "fresh" },
+      }),
+    ).toBe(true)
   })
 
   it("renews the lease while owned and refuses a stale renewal", async () => {

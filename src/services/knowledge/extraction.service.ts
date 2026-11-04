@@ -136,9 +136,12 @@ export async function extractWithLLM(
   repositoryId: string,
   path: string,
   content: string,
-  language: string
+  language: string,
+  isCancelled: () => boolean = () => false
 ): Promise<ExtractionResult | null> {
   const fileName = path.split("/").pop() ?? path
+
+  if (isCancelled()) return null
 
   // Skip files that are too long or too short
   if (content.length < 50 || content.length > 50000) return null
@@ -151,6 +154,7 @@ export async function extractWithLLM(
     fileName,
     language,
   })
+  if (isCancelled()) return null
   const parsed = parseCodeAnalysisResult(analysis)
 
   try {
@@ -272,7 +276,7 @@ export async function extractAssetsFromRepo(
   repositoryId: string,
   owner: string,
   repoName: string,
-  options?: { maxFiles?: number; useLLM?: boolean }
+  options?: { maxFiles?: number; useLLM?: boolean; isCancelled?: () => boolean }
 ): Promise<{ extracted: number; skipped: number; embedded: number }> {
   const { fetchRepoFileTree, fetchFileContent } = await import("@/services/github")
 
@@ -287,6 +291,9 @@ export async function extractAssetsFromRepo(
 
   const maxFiles = options?.maxFiles ?? 20
   const useLLM = options?.useLLM ?? true
+  const isCancelled = options?.isCancelled ?? (() => false)
+
+  if (isCancelled()) return { extracted: 0, skipped: 0, embedded: 0 }
 
   const tree = await fetchRepoFileTree(userId, owner, repoName)
 
@@ -316,12 +323,14 @@ export async function extractAssetsFromRepo(
   let embedded = 0
 
   for (const file of files) {
+    if (isCancelled()) break
     if (existingPaths.has(file.path)) {
       skipped++
       continue
     }
     try {
       const content = await fetchFileContent(userId, owner, repoName, file.path)
+      if (isCancelled()) break
       if (!content || content.length < 50) {
         skipped++
         continue
@@ -332,7 +341,7 @@ export async function extractAssetsFromRepo(
           skipped++
           continue
         }
-        const result = await extractWithLLM(userId, repositoryId, file.path, content, file.lang)
+        const result = await extractWithLLM(userId, repositoryId, file.path, content, file.lang, isCancelled)
         if (result) extracted++
         else skipped++
       } else {
@@ -343,8 +352,11 @@ export async function extractAssetsFromRepo(
 
       // Embedding is best-effort inside extractFromFile/extractWithLLM
       embedded = extracted
-    } catch {
-      skipped++
+    } catch (error) {
+      if (isCancelled()) break
+      // Rate limits, permission failures and other upstream errors must fail the
+      // Analysis so the worker can retry; they are not ordinary file skips.
+      throw error
     }
   }
 

@@ -313,7 +313,7 @@ describe("extractAssetsFromRepo", () => {
     expect(result).toEqual({ extracted: 1, skipped: 1, embedded: 1 })
   })
 
-  it("skips files whose content is too short or fails to load", async () => {
+  it("skips short content but propagates upstream file-loading failures", async () => {
     mocks.fetchRepoFileTree.mockResolvedValue(tree)
     mocks.findMany.mockResolvedValue([])
     mocks.fetchFileContent.mockImplementation(async (_, __, ___, path: string) => {
@@ -329,11 +329,12 @@ describe("extractAssetsFromRepo", () => {
     expect(result).toEqual({ extracted: 1, skipped: 1, embedded: 1 })
 
     mocks.fetchFileContent.mockRejectedValue(new Error("network"))
-    const failed = await extractAssetsFromRepo("user-1", "repo-1", "owner", "repo", {
-      maxFiles: 20,
-      useLLM: false,
-    })
-    expect(failed).toEqual({ extracted: 0, skipped: 2, embedded: 0 })
+    await expect(
+      extractAssetsFromRepo("user-1", "repo-1", "owner", "repo", {
+        maxFiles: 20,
+        useLLM: false,
+      }),
+    ).rejects.toThrow("network")
   })
 
   it("routes through the LLM path when useLLM=true", async () => {

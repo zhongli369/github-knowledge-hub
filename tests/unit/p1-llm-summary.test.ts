@@ -69,7 +69,7 @@ const summaryJson = JSON.stringify(summary)
 const savedKey = process.env.OPENAI_API_KEY
 const savedRetryDelay = process.env.LLM_RETRY_BASE_DELAY_MS
 
-const workerOpts = { analysisId: "analysis-w", workerId: "worker-1" }
+const workerOpts = { analysisId: "analysis-w", workerId: "worker-1", fencingToken: 2 }
 
 function completion(content: string, usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }) {
   return { choices: [{ message: { content } }], usage }
@@ -253,6 +253,7 @@ describe("analyzeRepoSummary — worker path (analysisId)", () => {
     expect(mocks.completeAnalysis).toHaveBeenCalledWith({
       analysisId: "analysis-w",
       workerId: "worker-1",
+      fencingToken: 2,
       status: "completed",
       result: expect.objectContaining({ summary }),
       model: expect.any(String),

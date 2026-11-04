@@ -1,13 +1,32 @@
+#!/usr/bin/env node
 /**
  * Background analysis worker (P1 Agent B).
  *
  * Usage: npm run worker
  *
- * Polls for claimable analyses and processes them via the LLM service. A task
- * is claimed atomically through PostgreSQL (FOR UPDATE SKIP LOCKED); the lease
- * is renewed by a heartbeat while a task is processed; terminal updates are
- * conditional on the worker still owning a valid lease so a stale worker can
+ * Polls for claimable analyses and processes them via services (LLM +
+ * extraction). A task is claimed atomically through PostgreSQL
+ * (FOR UPDATE SKIP LOCKED); the lease is renewed by a heartbeat while a task
+ * is processed; terminal updates are conditional on the worker still owning a
+ * valid lease and carrying the correct fencing token so a stale worker can
  * never overwrite a newer worker's result.
+ *
+ * Reliability model:
+ *   * True concurrency pool — up to MAX_CONCURRENT tasks in flight at once.
+ *   * Bounded retries — each claim increments `attempts`; the lease layer caps
+ *     re-claims at MAX_ATTEMPTS and terminally fails poisoned tasks.
+ *   * Heartbeat watch — every `renewLease` failure marks the claim dead; once
+ *     dead, no further asset/result writes are attempted (the fencing writes
+ *     in leasing.service would reject them anyway, but the worker also stops
+ *     launching them).
+ *   * Monotonic fencing — `analysis.attempts` captured at claim time is passed
+ *     into every renew/complete/fail, so a reclaimed task can never be
+ *     mutated by its stale owner.
+ *   * Task timeout — a hard wall-clock ceiling per processing run; on timeout
+ *     the task is failed and retried (bounded by attempts), never completed.
+ *   * Ownership verification — the worker refuses to process an analysis whose
+ *     repository is not owned by `analysis.userId`; such tasks fail closed and
+ *     no assets are ever written.
  */
 
 import path from "node:path"
@@ -15,7 +34,7 @@ import { pathToFileURL } from "node:url"
 import { prisma } from "@/lib/prisma"
 import { analyzeRepoSummary, AnalysisError } from "@/services/llm/analysis.service"
 import { extractAssetsFromRepo } from "@/services/knowledge/extraction.service"
-import { createOctokit } from "@/lib/github/client"
+import { fetchRepoReadme } from "@/services/github"
 import {
   claimNextAnalysis,
   completeAnalysis,
@@ -26,145 +45,296 @@ import {
   type ClaimableAnalysis,
 } from "@/services/analysis/leasing.service"
 
-const POLL_INTERVAL_MS = 5_000
-const MAX_CONCURRENT = 3
+export const POLL_INTERVAL_MS = 5_000
+
+/** How many analyses may be processed concurrently in this process. */
+export const MAX_CONCURRENT = 3
+
+/**
+ * Hard wall-clock budget for a single processing run. Overridable through
+ * `WORKER_TASK_TIMEOUT_MS` (milliseconds) for tests and constrained deploys.
+ * The lease is far shorter (60s) and renewed by heartbeat, so this is purely a
+ * last-resort abort for genuinely hung calls (e.g. a wedged LLM/native fetch).
+ */
+export const DEFAULT_TASK_TIMEOUT_MS = 10 * 60_000
+
+function taskTimeoutMs(): number {
+  const raw = Number(process.env.WORKER_TASK_TIMEOUT_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_TASK_TIMEOUT_MS
+}
 
 // Unique identity for this worker process. Overridable for tests/containers.
 const WORKER_ID = process.env.WORKER_ID || createWorkerId()
 
-let running = 0
+/** Claims currently being processed. The pool guard and the main loop read it. */
+export const activeJobs = new Set<Promise<void>>()
 
-async function processClaimed(analysis: ClaimableAnalysis): Promise<void> {
-  console.log(`[worker] Processing analysis ${analysis.id} (${analysis.analysisType}) owned by ${WORKER_ID}`)
-
-  switch (analysis.analysisType) {
-    case "repo_summary": {
-      if (!analysis.repositoryId) {
-        throw new Error("Missing repositoryId for repo_summary analysis")
-      }
-
-      const repo = await prisma.repository.findUnique({
-        where: { id: analysis.repositoryId },
-        select: {
-          name: true,
-          fullName: true,
-          description: true,
-          language: true,
-          topics: true,
-          stars: true,
-          forks: true,
-          url: true,
-          defaultBranch: true,
-          owner: true,
-        },
-      })
-
-      if (!repo) {
-        throw new Error("Repository not found")
-      }
-
-      // Token loading/decryption errors must fail the task explicitly. Only a
-      // README request made with a valid token may fall back to no README.
-      const octokit = await createOctokit(analysis.userId)
-      let readme: string | null = null
-      try {
-        const { data } = await octokit.repos.getReadme({
-          owner: repo.owner,
-          repo: repo.name,
-        })
-        readme = Buffer.from(data.content, "base64").toString("utf-8")
-      } catch {
-        console.log(`[worker] No README found for ${repo.fullName}, continuing without`)
-      }
-
-      // The shared service persists the result conditionally with our lease.
-      await analyzeRepoSummary(
-        analysis.repositoryId,
-        analysis.userId,
-        {
-          name: repo.name,
-          fullName: repo.fullName,
-          description: repo.description,
-          language: repo.language,
-          topics: repo.topics,
-          stars: repo.stars,
-          forks: repo.forks,
-          url: repo.url,
-          defaultBranch: repo.defaultBranch,
-        },
-        readme,
-        { analysisId: analysis.id, workerId: WORKER_ID }
-      )
-
-      console.log(`[worker] Completed repo_summary for ${repo.fullName}`)
-      break
-    }
-    case "asset_extraction": {
-      if (!analysis.repositoryId) {
-        throw new Error("Missing repositoryId for asset_extraction")
-      }
-
-      const repo = await prisma.repository.findUnique({
-        where: { id: analysis.repositoryId },
-        select: { owner: true, name: true },
-      })
-
-      if (!repo) {
-        throw new Error("Repository not found")
-      }
-
-      const input = (analysis.input as Record<string, unknown>) ?? {}
-      const result = await extractAssetsFromRepo(
-        analysis.userId,
-        analysis.repositoryId,
-        repo.owner,
-        repo.name,
-        {
-          maxFiles: (input.maxFiles as number) ?? 20,
-          useLLM: (input.useLLM as boolean) ?? true,
-        }
-      )
-
-      const completed = await completeAnalysis({
-        analysisId: analysis.id,
-        workerId: WORKER_ID,
-        status: "completed",
-        result: JSON.parse(JSON.stringify(result)),
-      })
-      if (!completed) {
-        console.warn(`[worker] Lost lease for ${analysis.id}; asset extraction result not persisted`)
-      }
-
-      console.log(`[worker] Completed asset_extraction for ${repo.owner}/${repo.name}: ${result.extracted} extracted, ${result.skipped} skipped`)
-      break
-    }
-    default:
-      throw new Error(`Unsupported analysis type: ${analysis.analysisType}`)
+/** Thrown internally to suppress writes once a claim is dead/timeout/reclaimed. */
+export class LeaseLostError extends Error {
+  constructor(message?: string) {
+    super(message ?? "Lease lost or task cancelled")
+    this.name = "LeaseLostError"
   }
 }
 
-export async function processOne(): Promise<boolean> {
-  if (running >= MAX_CONCURRENT) return false
+export class TaskTimeoutError extends Error {
+  constructor(taskId: string, ms: number) {
+    super(`Task ${taskId} exceeded ${ms}ms timeout`)
+    this.name = "TaskTimeoutError"
+  }
+}
 
-  // Atomically claim the next pending or lease-expired task.
-  const analysis = await claimNextAnalysis({ workerId: WORKER_ID })
-  if (!analysis) return false
+class OwnershipMismatchError extends Error {
+  override readonly name = "OwnershipMismatchError"
+}
 
-  running++
+/**
+ * Per-claim cancellation/watchdog state.
+ *
+ * `alive` flips to false when the heartbeat stops succeeding, the task exceeds
+ * its timeout, or — defensively — when the claim is otherwise no longer owned.
+ * All subsequent writes are gated on `isAlive()`.
+ */
+interface ClaimContext {
+  analysisId: string
+  alive: boolean
+  reason: string | null
+  isAlive(): boolean
+  cancel(reason: string): void
+}
 
-  // Renew the lease on a schedule well under the lease duration.
+function createContext(analysisId: string): ClaimContext {
+  const ctx: ClaimContext = {
+    analysisId,
+    alive: true,
+    reason: null,
+    isAlive() {
+      return ctx.alive
+    },
+    cancel(reason: string) {
+      if (ctx.alive) {
+        ctx.alive = false
+        ctx.reason = reason
+      }
+    },
+  }
+  return ctx
+}
+
+/**
+ * Run `promise`, but reject with `makeError()` after `ms` and invoke
+ * `onTimeout` so the caller can mark the work cancelled. The underlying
+ * promise keeps running in the background; its late result is ignored because
+ * every write it attempts after cancellation is gated on `isAlive()`.
+ */
+function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  onTimeout: () => void,
+  makeError: () => Error,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      onTimeout()
+      reject(makeError())
+    }, ms)
+    timer.unref?.()
+  })
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
+}
+
+/** Security boundary: refuse to work a task whose repository is not owned by the analysis owner. */
+function assertOwnership(repoUserId: string, analysisUserId: string, analysisId: string): void {
+  if (repoUserId !== analysisUserId) {
+    throw new OwnershipMismatchError(
+      `Ownership mismatch: analysis ${analysisId} is owned by userId=${analysisUserId} but its repository belongs to userId=${repoUserId}`,
+    )
+  }
+}
+
+/**
+ * Process a claimed analysis. `ctx` gates every write; once the claim is dead
+ * the function stops launching writes and suppresses any late error it hits.
+ * All terminal writes are fenced with the claim-time `attempts` token.
+ */
+async function processClaimed(analysis: ClaimableAnalysis, ctx: ClaimContext): Promise<void> {
+  try {
+    switch (analysis.analysisType) {
+      case "repo_summary": {
+        if (!analysis.repositoryId) {
+          throw new Error("Missing repositoryId for repo_summary analysis")
+        }
+
+        const repo = await prisma.repository.findUnique({
+          where: { id: analysis.repositoryId },
+          select: {
+            name: true,
+            fullName: true,
+            description: true,
+            language: true,
+            topics: true,
+            stars: true,
+            forks: true,
+            url: true,
+            defaultBranch: true,
+            owner: true,
+            userId: true,
+          },
+        })
+
+        if (!repo) {
+          throw new Error("Repository not found")
+        }
+        // fail-closed: never analyze (or produce assets for) a repo the
+        // analysis owner does not own.
+        assertOwnership(repo.userId, analysis.userId, analysis.id)
+
+        // Only a genuine 404 means "no README". 403/429/5xx/network errors are
+        // rethrown by fetchRepoReadme so the task fails (and retries) instead
+        // of completing with a silently-missing README.
+        const readme = await fetchRepoReadme(analysis.userId, repo.owner, repo.name)
+
+        if (!ctx.isAlive()) throw new LeaseLostError()
+
+        // The shared service persists the result conditionally with our lease
+        // AND our fencing token.
+        await analyzeRepoSummary(
+          analysis.repositoryId,
+          analysis.userId,
+          {
+            name: repo.name,
+            fullName: repo.fullName,
+            description: repo.description,
+            language: repo.language,
+            topics: repo.topics,
+            stars: repo.stars,
+            forks: repo.forks,
+            url: repo.url,
+            defaultBranch: repo.defaultBranch,
+          },
+          readme,
+          {
+            analysisId: analysis.id,
+            workerId: WORKER_ID,
+            fencingToken: analysis.attempts,
+            canWrite: () => ctx.isAlive(),
+          },
+        )
+
+        console.log(`[worker] Completed repo_summary for ${repo.fullName}`)
+        break
+      }
+
+      case "asset_extraction": {
+        if (!analysis.repositoryId) {
+          throw new Error("Missing repositoryId for asset_extraction")
+        }
+
+        const repo = await prisma.repository.findUnique({
+          where: { id: analysis.repositoryId },
+          select: { owner: true, name: true, userId: true },
+        })
+
+        if (!repo) {
+          throw new Error("Repository not found")
+        }
+        // fail-closed: never write assets for a repo the analysis owner does
+        // not own.
+        assertOwnership(repo.userId, analysis.userId, analysis.id)
+
+        const input = (analysis.input as Record<string, unknown>) ?? {}
+        const result = await extractAssetsFromRepo(
+          analysis.userId,
+          analysis.repositoryId,
+          repo.owner,
+          repo.name,
+          {
+            maxFiles: (input.maxFiles as number) ?? 20,
+            useLLM: (input.useLLM as boolean) ?? true,
+            // Stop the extraction loop on heartbeat loss so a stale worker can
+            // not keep writing knowledge assets after losing the lease.
+            isCancelled: () => !ctx.isAlive(),
+          },
+        )
+
+        if (!ctx.isAlive()) throw new LeaseLostError()
+
+        const completed = await completeAnalysis({
+          analysisId: analysis.id,
+          workerId: WORKER_ID,
+          status: "completed",
+          result: JSON.parse(JSON.stringify(result)),
+          fencingToken: analysis.attempts,
+        })
+        if (!completed) {
+          console.warn(`[worker] Lost lease for ${analysis.id}; asset extraction result not persisted`)
+        }
+
+        console.log(
+          `[worker] Completed asset_extraction for ${repo.owner}/${repo.name}: ${result.extracted} extracted, ${result.skipped} skipped`,
+        )
+        break
+      }
+
+      default:
+        throw new Error(`Unsupported analysis type: ${analysis.analysisType}`)
+    }
+  } catch (error) {
+    if (!ctx.isAlive()) {
+      // The claim is already dead (heartbeat loss, timeout, or reclaim). Do not
+      // launch any further write; suppress the late error silently.
+      return
+    }
+    throw error
+  }
+}
+
+/**
+ * Fully process one already-claimed analysis: heartbeat renewal on a timer,
+ * hard timeout, and a fenced terminal update. Returns `true` when the run
+ * ended without needing to release the task back for retry (i.e. it completed
+ * or the claim was already dead), `false` when it had to fail the task.
+ */
+export async function runClaimed(analysis: ClaimableAnalysis): Promise<boolean> {
+  const ctx = createContext(analysis.id)
+  const fencingToken = analysis.attempts
+  const timeoutMs = taskTimeoutMs()
+
+  // Renew the lease on a schedule well under the lease duration. A renewal
+  // that returns false means the lease is gone (expired and reclaimed, fencing
+  // no longer matches, or the row reached a terminal state): stop writing.
   const heartbeat = setInterval(() => {
-    renewLease({ analysisId: analysis.id, workerId: WORKER_ID }).catch((err) => {
-      console.warn(`[worker] Heartbeat failed for ${analysis.id}:`, (err as Error).message)
-    })
+    renewLease({ analysisId: analysis.id, workerId: WORKER_ID, fencingToken })
+      .then((ok) => {
+        if (!ok) {
+          console.warn(`[worker] Heartbeat failed for ${analysis.id}; stopping subsequent writes`)
+          ctx.cancel("heartbeat-lease-lost")
+        }
+      })
+      .catch((err) => {
+        // Fail closed on transport/database errors too: a worker that cannot
+        // prove its lease is still valid must not keep producing writes.
+        console.warn(`[worker] Heartbeat error for ${analysis.id}:`, (err as Error).message)
+        ctx.cancel("heartbeat-renewal-error")
+      })
   }, HEARTBEAT_INTERVAL_MS)
   heartbeat.unref?.()
 
   try {
-    await processClaimed(analysis)
+    await withTimeout(
+      processClaimed(analysis, ctx),
+      timeoutMs,
+      () => ctx.cancel(`task-timeout-${timeoutMs}`),
+      () => new TaskTimeoutError(analysis.id, timeoutMs),
+    )
+    return true
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : "Unknown error"
     console.error(`[worker] Failed analysis ${analysis.id}: ${errMsg}`)
+    // Release the task for (bounded) retry, or terminally fail it once attempts
+    // are exhausted. The write is conditional on the lease AND the fencing
+    // token, so a stale worker can never persist a stale error.
     const persisted = await failAnalysis({
       analysisId: analysis.id,
       workerId: WORKER_ID,
@@ -172,16 +342,59 @@ export async function processOne(): Promise<boolean> {
       // Preserve the duration measured by the shared LLM call when available so
       // a failed task still carries a meaningful durationMs.
       durationMs: error instanceof AnalysisError ? error.durationMs : undefined,
+      // Ownership violations are permanent and must not be retried into more
+      // executions. Other failures retain the normal bounded retry policy.
+      maxAttempts: error instanceof OwnershipMismatchError ? analysis.attempts : undefined,
+      fencingToken,
     })
     if (!persisted) {
       console.warn(`[worker] Lost lease before failing ${analysis.id}; stale error not persisted`)
     }
+    return false
   } finally {
     clearInterval(heartbeat)
-    running--
   }
+}
 
+/**
+ * Claim the next task and dispatch its processing into the concurrency pool.
+ * Returns `true` when a task was claimed+dispatched, `false` when the pool is
+ * full or the queue is empty. The dispatched job runs in the background; await
+ * `flushActive()` to wait for all in-flight jobs.
+ */
+export async function processOne(): Promise<boolean> {
+  if (activeJobs.size >= MAX_CONCURRENT) return false
+
+  // Atomically claim the next pending, no-lease, or lease-expired task.
+  const analysis = await claimNextAnalysis({ workerId: WORKER_ID })
+  if (!analysis) return false
+
+  void trackClaim(analysis)
   return true
+}
+
+/** Start a background claim and keep it tracked in the pool until it settles. */
+async function trackClaim(analysis: ClaimableAnalysis): Promise<void> {
+  const job = runClaimed(analysis).then(
+    () => {},
+    () => {},
+  )
+  activeJobs.add(job)
+  try {
+    await job
+  } finally {
+    activeJobs.delete(job)
+  }
+}
+
+/** Wait for every in-flight claim to settle. Used by tests and shutdown. */
+export async function flushActive(): Promise<void> {
+  await Promise.allSettled([...activeJobs])
+}
+
+async function waitForActiveSlot(): Promise<void> {
+  if (activeJobs.size === 0) return
+  await Promise.race([...activeJobs])
 }
 
 export async function main() {
@@ -189,6 +402,7 @@ export async function main() {
 
   const shutdown = async () => {
     console.log("[worker] Shutting down...")
+    await flushActive()
     await prisma.$disconnect()
     process.exit(0)
   }
@@ -198,13 +412,19 @@ export async function main() {
 
   while (true) {
     try {
-      let processed = false
+      // Fill the pool: keep claiming until it is full or the queue is drained.
+      let claimed = false
       while (await processOne()) {
-        processed = true
+        claimed = true
       }
-      if (!processed) {
+
+      if (activeJobs.size >= MAX_CONCURRENT) {
+        // Pool is full; resume as soon as the first job settles.
+        await waitForActiveSlot()
+      } else if (!claimed) {
         await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS))
       }
+      // claimed && pool not full: loop immediately to keep filling the pool.
     } catch (error) {
       console.error("[worker] Error in main loop:", error)
       await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS))

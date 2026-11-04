@@ -51,7 +51,12 @@ export async function analyzeRepoSummary(
     defaultBranch: string
   },
   readme: string | null,
-  opts?: { analysisId?: string; workerId?: string }
+  opts?: {
+    analysisId?: string
+    workerId?: string
+    fencingToken?: number
+    canWrite?: () => boolean
+  }
 ): Promise<{ summary: RepoSummary; cached: boolean }> {
   // ── Worker path: use existing claimed record ──────────────────
   if (opts?.analysisId) {
@@ -59,8 +64,8 @@ export async function analyzeRepoSummary(
     // terminal update stays conditional on a valid lease; a stale worker can
     // never overwrite a newer worker's result. Only the leasing worker calls
     // this path with a workerId.
-    if (!opts.workerId) {
-      throw new AnalysisError("UNKNOWN", "Worker analysis requires a worker identity")
+    if (!opts.workerId || opts.fencingToken == null) {
+      throw new AnalysisError("UNKNOWN", "Worker analysis requires a worker identity and fencing token")
     }
 
     let summary: RepoSummary
@@ -71,9 +76,16 @@ export async function analyzeRepoSummary(
       throw error instanceof AnalysisError ? error : normalizeAnalysisError(error)
     }
 
+    // A heartbeat/timeout may have invalidated the claim while the LLM call was
+    // in flight. Do not even attempt a terminal write after that point.
+    if (opts.canWrite && !opts.canWrite()) {
+      return { summary, cached: false }
+    }
+
     const completed = await completeAnalysis({
       analysisId: opts.analysisId,
       workerId: opts.workerId,
+      fencingToken: opts.fencingToken,
       status: "completed",
       result: JSON.parse(JSON.stringify({ summary, rawContent: summary.oneLine })),
       model: getModel(),
