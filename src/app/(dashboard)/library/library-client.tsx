@@ -265,38 +265,10 @@ export function LibraryClient({ items }: { items: LibraryItem[] }) {
     setBatchStatuses({})
     stopRef.current = false
 
-    // Pre-flight: check first item for API key issues
-    const firstResult = await analyzeRepositoryAction(batchTargets[0].id)
-    if (firstResult.errorCode === "API_KEY_MISSING") {
-      setBatchState("completed_with_errors")
-      setBatchResults({ success: 0, failed: batchTargets.length })
-      return
-    }
-
     let success = 0
     let failed = 0
 
-    // Process first item result
-    if (firstResult.summary) {
-      success++
-      setBatchStatuses((prev) => ({ ...prev, [batchTargets[0].id]: "completed" }))
-      setLocalItems((prev) =>
-        prev.map((li) =>
-          li.id === batchTargets[0].id
-            ? { ...li, analysisStatus: "completed", summaryOneLine: firstResult.summary?.oneLine ?? null }
-            : li
-        )
-      )
-    } else {
-      failed++
-      setBatchStatuses((prev) => ({ ...prev, [batchTargets[0].id]: "failed" }))
-      setLocalItems((prev) =>
-        prev.map((li) => (li.id === batchTargets[0].id ? { ...li, analysisStatus: "failed" } : li))
-      )
-    }
-    setBatchResults({ success, failed })
-
-    for (let i = 1; i < batchTargets.length; i++) {
+    for (let i = 0; i < batchTargets.length; i++) {
       if (stopRef.current) break
 
       const item = batchTargets[i]
@@ -305,6 +277,16 @@ export function LibraryClient({ items }: { items: LibraryItem[] }) {
 
       try {
         const result = await analyzeRepositoryAction(item.id)
+
+        // The first item is also a pre-flight check: do not issue the same
+        // guaranteed-to-fail request for every remaining repository.
+        if (i === 0 && result.errorCode === "API_KEY_MISSING") {
+          failed = batchTargets.length
+          setBatchStatuses((prev) => ({ ...prev, [item.id]: "failed" }))
+          setBatchResults({ success, failed })
+          break
+        }
+
         if (result.summary) {
           setBatchStatuses((prev) => ({ ...prev, [item.id]: "completed" }))
           setLocalItems((prev) =>
@@ -324,6 +306,9 @@ export function LibraryClient({ items }: { items: LibraryItem[] }) {
         }
       } catch {
         setBatchStatuses((prev) => ({ ...prev, [item.id]: "failed" }))
+        setLocalItems((prev) =>
+          prev.map((li) => (li.id === item.id ? { ...li, analysisStatus: "failed" } : li))
+        )
         failed++
       }
 

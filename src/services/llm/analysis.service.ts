@@ -2,6 +2,18 @@ import { openai } from "@/lib/openai"
 import { prisma } from "@/lib/prisma"
 import { generateRepoEmbedding } from "@/services/llm/repo-embedding.service"
 import { completeAnalysis } from "@/services/analysis/leasing.service"
+import {
+  extractTokenUsage,
+  isRetryableLLMError,
+  withRetry,
+  LLM_MAX_RETRIES,
+  type AnalysisMetrics,
+  type OpenAICompletionResponseLike,
+} from "@/services/llm/llm-telemetry"
+
+type RepoSummaryLLMResponse = OpenAICompletionResponseLike & {
+  choices?: Array<{ message?: { content?: string | null } }>
+}
 
 const PROMPT_VERSION = "repo-summary-v1"
 
@@ -52,10 +64,11 @@ export async function analyzeRepoSummary(
     }
 
     let summary: RepoSummary
+    let metrics: AnalysisMetrics
     try {
-      summary = await executeRepoSummaryCall(repoMeta, readme)
+      ;({ summary, metrics } = await executeRepoSummaryCall(repoMeta, readme))
     } catch (error) {
-      throw normalizeAnalysisError(error)
+      throw error instanceof AnalysisError ? error : normalizeAnalysisError(error)
     }
 
     const completed = await completeAnalysis({
@@ -64,6 +77,8 @@ export async function analyzeRepoSummary(
       status: "completed",
       result: JSON.parse(JSON.stringify({ summary, rawContent: summary.oneLine })),
       model: getModel(),
+      tokensUsed: metrics.tokensUsed ?? 0,
+      durationMs: metrics.durationMs,
     })
 
     if (completed) {
@@ -119,14 +134,18 @@ export async function analyzeRepoSummary(
     },
   })
 
+  const overallStartedAt = Date.now()
+
   try {
-    const summary = await executeRepoSummaryCall(repoMeta, readme)
+    const { summary, metrics } = await executeRepoSummaryCall(repoMeta, readme)
 
     await prisma.analysis.update({
       where: { id: analysis.id },
       data: {
         status: "completed",
         result: JSON.parse(JSON.stringify({ summary, rawContent: summary.oneLine })),
+        tokensUsed: metrics.tokensUsed ?? 0,
+        durationMs: metrics.durationMs,
       },
     })
 
@@ -135,10 +154,18 @@ export async function analyzeRepoSummary(
 
     return { summary, cached: false }
   } catch (error) {
-    const analysisError = normalizeAnalysisError(error)
+    const analysisError = error instanceof AnalysisError ? error : normalizeAnalysisError(error)
+    // Preserve the precise LLM-call duration when available; otherwise fall
+    // back to the wall time we spent in this block so failed tasks still carry
+    // a meaningful durationMs.
+    analysisError.durationMs ??= Math.max(0, Date.now() - overallStartedAt)
     await prisma.analysis.update({
       where: { id: analysis.id },
-      data: { status: "failed", error: analysisError.message.slice(0, 1000) },
+      data: {
+        status: "failed",
+        error: analysisError.message.slice(0, 1000),
+        durationMs: analysisError.durationMs,
+      },
     })
     throw analysisError
   }
@@ -187,7 +214,7 @@ async function executeRepoSummaryCall(
   },
   readme: string | null,
   lang: "zh" | "en" = "zh"
-): Promise<RepoSummary> {
+): Promise<{ summary: RepoSummary; metrics: AnalysisMetrics }> {
   if (!process.env.OPENAI_API_KEY) {
     throw new AnalysisError(
       "API_KEY_MISSING",
@@ -280,17 +307,45 @@ async function executeRepoSummaryCall(
         "}",
       ].join("\n")
 
-  const response = await openai.chat.completions.create({
-    model: getModel(),
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt },
-    ],
-    temperature: 0.3,
-    max_tokens: 2048,
-  })
+  const startedAt = Date.now()
 
-  const content = response.choices[0]?.message?.content ?? ""
+  // Transient failures (rate limits, 5xx, network) are retried with bounded
+  // backoff; deterministic failures (invalid key, bad request) surface
+  // immediately.
+  let response: RepoSummaryLLMResponse
+  try {
+    response = await withRetry(
+      () =>
+        openai.chat.completions.create({
+          model: getModel(),
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+          temperature: 0.3,
+          max_tokens: 2048,
+        }),
+      {
+        maxRetries: LLM_MAX_RETRIES,
+        isRetryable: isRetryableLLMError,
+        onRetry: (err, attempt) => {
+          console.warn(
+            `[llm] Retrying repo summary call (${attempt}/${LLM_MAX_RETRIES}):`,
+            (err as Error).message
+          )
+        },
+      }
+    )
+  } catch (error) {
+    const analysisError = normalizeAnalysisError(error)
+    analysisError.durationMs = Date.now() - startedAt
+    throw analysisError
+  }
+
+  const durationMs = Date.now() - startedAt
+  const tokensUsed = extractTokenUsage(response)
+
+  const content = response.choices?.[0]?.message?.content ?? ""
 
   // Clean markdown code fences if present
   const jsonStr = content
@@ -298,7 +353,16 @@ async function executeRepoSummaryCall(
     .replace(/\s*```$/, "")
     .trim()
 
-  return JSON.parse(jsonStr) as RepoSummary
+  let summary: RepoSummary
+  try {
+    summary = JSON.parse(jsonStr) as RepoSummary
+  } catch (error) {
+    const analysisError = normalizeAnalysisError(error)
+    analysisError.durationMs = durationMs
+    throw analysisError
+  }
+
+  return { summary, metrics: { durationMs, tokensUsed } }
 }
 
 // ── Error types ─────────────────────────────────────────────────
@@ -314,6 +378,8 @@ export type AnalysisErrorCode =
 
 export class AnalysisError extends Error {
   code: AnalysisErrorCode
+  /** Wall-clock ms of the failing LLM call when it was measured. */
+  durationMs?: number
   constructor(code: AnalysisErrorCode, message: string) {
     super(message)
     this.code = code
@@ -330,6 +396,8 @@ export interface AnalysisMeta {
   summary: RepoSummary | null
   cachedAt: string | null
   model: string | null
+  tokensUsed: number
+  durationMs: number
   error: string | null
 }
 
@@ -346,12 +414,22 @@ export async function getRepoAnalysisStatus(repoId: string, userId: string): Pro
       result: true,
       error: true,
       model: true,
+      tokensUsed: true,
+      durationMs: true,
       createdAt: true,
     },
   })
 
   if (!analysis) {
-    return { status: "not_generated", summary: null, cachedAt: null, model: null, error: null }
+    return {
+      status: "not_generated",
+      summary: null,
+      cachedAt: null,
+      model: null,
+      tokensUsed: 0,
+      durationMs: 0,
+      error: null,
+    }
   }
 
   const dbStatus = analysis.status as AnalysisStatus
@@ -363,6 +441,8 @@ export async function getRepoAnalysisStatus(repoId: string, userId: string): Pro
     summary,
     cachedAt: analysis.createdAt.toISOString(),
     model: analysis.model ?? null,
+    tokensUsed: analysis.tokensUsed,
+    durationMs: analysis.durationMs,
     error: analysis.error ?? null,
   }
 }
@@ -505,15 +585,28 @@ export async function analyzeCodePatterns(opts: AnalyzeCodeOpts): Promise<string
       ].join("\n")
 
   try {
-    const response = await openai.chat.completions.create({
-      model: getModel(),
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-      temperature: 0.3,
-      max_tokens: 1024,
-    })
+    const response = await withRetry(
+      () =>
+        openai.chat.completions.create({
+          model: getModel(),
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+          temperature: 0.3,
+          max_tokens: 1024,
+        }),
+      {
+        maxRetries: LLM_MAX_RETRIES,
+        isRetryable: isRetryableLLMError,
+        onRetry: (err, attempt) => {
+          console.warn(
+            `[llm] Retrying code pattern analysis (${attempt}/${LLM_MAX_RETRIES}):`,
+            (err as Error).message
+          )
+        },
+      }
+    )
 
     const content = response.choices[0]?.message?.content ?? ""
     const jsonStr = content
@@ -534,11 +627,16 @@ function fallbackResult(fileName: string): string {
     whatItDoes: "LLM parse failed — retry or check manually",
     reuseValue: "",
     keyInsight: "",
-    difficulty: "intermediate",
+    // Empty (not "intermediate") so the extraction layer maps it to an unknown
+    // difficulty instead of fabricating a value for a failed LLM call.
+    difficulty: "",
   })
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export async function analyzeDependencies(_opts?: any): Promise<string> {
+  // Kept for a future compatibility signature; the stub currently makes no use
+  // of its inputs.
+  void _opts
   throw new Error("analyzeDependencies is not implemented in Phase 7.0 MVP")
 }

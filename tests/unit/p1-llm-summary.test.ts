@@ -67,12 +67,18 @@ const summary: RepoSummary = {
 const summaryJson = JSON.stringify(summary)
 
 const savedKey = process.env.OPENAI_API_KEY
+const savedRetryDelay = process.env.LLM_RETRY_BASE_DELAY_MS
 
 const workerOpts = { analysisId: "analysis-w", workerId: "worker-1" }
+
+function completion(content: string, usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }) {
+  return { choices: [{ message: { content } }], usage }
+}
 
 beforeEach(() => {
   vi.clearAllMocks()
   process.env.OPENAI_API_KEY = "sk-test-not-real"
+  process.env.LLM_RETRY_BASE_DELAY_MS = "0" // keep retry tests fast
   mocks.update.mockResolvedValue({})
   mocks.generateRepoEmbedding.mockResolvedValue(true)
   mocks.completeAnalysis.mockResolvedValue(true)
@@ -81,15 +87,17 @@ beforeEach(() => {
 afterEach(() => {
   if (savedKey === undefined) delete process.env.OPENAI_API_KEY
   else process.env.OPENAI_API_KEY = savedKey
+  if (savedRetryDelay === undefined) delete process.env.LLM_RETRY_BASE_DELAY_MS
+  else process.env.LLM_RETRY_BASE_DELAY_MS = savedRetryDelay
 })
 
 describe("analyzeRepoSummary — direct path", () => {
   it("creates a running record, calls the LLM and completes with the parsed summary", async () => {
     mocks.findFirst.mockResolvedValue(null)
     mocks.create.mockResolvedValue({ id: "analysis-1" })
-    mocks.openaiCreate.mockResolvedValue({
-      choices: [{ message: { content: summaryJson } }],
-    })
+    mocks.openaiCreate.mockResolvedValue(
+      completion(summaryJson, { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 })
+    )
 
     const result = await analyzeRepoSummary("repo-1", "user-1", repoMeta, "# Hello")
 
@@ -101,10 +109,57 @@ describe("analyzeRepoSummary — direct path", () => {
       data: expect.objectContaining({
         status: "completed",
         result: expect.objectContaining({ summary }),
+        tokensUsed: 150,
+        durationMs: expect.any(Number),
       }),
     })
     // embedding is best-effort, fired after completion
     expect(mocks.generateRepoEmbedding).toHaveBeenCalledWith("repo-1", "user-1")
+  })
+
+  it("records tokensUsed as 0 when the provider reports no usage", async () => {
+    mocks.findFirst.mockResolvedValue(null)
+    mocks.create.mockResolvedValue({ id: "analysis-no-usage" })
+    mocks.openaiCreate.mockResolvedValue(completion(summaryJson))
+
+    await analyzeRepoSummary("repo-1", "user-1", repoMeta, "# Hello")
+
+    expect(mocks.update).toHaveBeenLastCalledWith({
+      where: { id: "analysis-no-usage" },
+      data: expect.objectContaining({
+        status: "completed",
+        tokensUsed: 0,
+        durationMs: expect.any(Number),
+      }),
+    })
+  })
+
+  it("retries a transient 429 once, then completes successfully", async () => {
+    mocks.findFirst.mockResolvedValue(null)
+    mocks.create.mockResolvedValue({ id: "analysis-retry-429" })
+    mocks.openaiCreate
+      .mockRejectedValueOnce(new Error("429 Too Many Requests — rate limit exceeded"))
+      .mockResolvedValueOnce(completion(summaryJson, { total_tokens: 77 }))
+
+    const result = await analyzeRepoSummary("repo-1", "user-1", repoMeta, null)
+
+    expect(result.cached).toBe(false)
+    expect(mocks.openaiCreate).toHaveBeenCalledTimes(2)
+    expect(mocks.update).toHaveBeenLastCalledWith({
+      where: { id: "analysis-retry-429" },
+      data: expect.objectContaining({ status: "completed", tokensUsed: 77 }),
+    })
+  })
+
+  it("does not retry deterministic API key failures", async () => {
+    mocks.findFirst.mockResolvedValue(null)
+    mocks.create.mockResolvedValue({ id: "analysis-no-retry-key" })
+    mocks.openaiCreate.mockRejectedValue(new Error("Incorrect API key provided"))
+
+    await expect(analyzeRepoSummary("repo-1", "user-1", repoMeta, null)).rejects.toMatchObject({
+      code: "API_KEY_MISSING",
+    })
+    expect(mocks.openaiCreate).toHaveBeenCalledTimes(1)
   })
 
   it("returns the cached summary without calling the LLM or creating a record", async () => {
@@ -188,9 +243,9 @@ describe("analyzeRepoSummary — worker path (analysisId)", () => {
   })
 
   it("persists via completeAnalysis only while the worker still owns the lease", async () => {
-    mocks.openaiCreate.mockResolvedValue({
-      choices: [{ message: { content: summaryJson } }],
-    })
+    mocks.openaiCreate.mockResolvedValue(
+      completion(summaryJson, { prompt_tokens: 40, completion_tokens: 20 })
+    )
 
     const result = await analyzeRepoSummary("repo-1", "user-1", repoMeta, "# Hello", workerOpts)
 
@@ -201,6 +256,8 @@ describe("analyzeRepoSummary — worker path (analysisId)", () => {
       status: "completed",
       result: expect.objectContaining({ summary }),
       model: expect.any(String),
+      tokensUsed: 60,
+      durationMs: expect.any(Number),
     })
     expect(mocks.findFirst).not.toHaveBeenCalled()
     expect(mocks.create).not.toHaveBeenCalled()
@@ -276,16 +333,20 @@ describe("getRepoAnalysisStatus", () => {
       summary: null,
       cachedAt: null,
       model: null,
+      tokensUsed: 0,
+      durationMs: 0,
       error: null,
     })
   })
 
-  it("reports completed status with the cached summary and model", async () => {
+  it("reports completed status with the cached summary, model and telemetry", async () => {
     mocks.findFirst.mockResolvedValue({
       status: "completed",
       result: { summary },
       error: null,
       model: "gpt-4o-mini",
+      tokensUsed: 1234,
+      durationMs: 3000,
       createdAt: new Date("2026-01-02T00:00:00.000Z"),
     })
     const meta = await getRepoAnalysisStatus("repo-1", "user-1")
@@ -294,6 +355,8 @@ describe("getRepoAnalysisStatus", () => {
     expect(meta.summary).toEqual(summary)
     expect(meta.cachedAt).toBe("2026-01-02T00:00:00.000Z")
     expect(meta.model).toBe("gpt-4o-mini")
+    expect(meta.tokensUsed).toBe(1234)
+    expect(meta.durationMs).toBe(3000)
   })
 
   it("surfaces the error of a failed analysis", async () => {
@@ -302,6 +365,8 @@ describe("getRepoAnalysisStatus", () => {
       result: null,
       error: "LLM call failed. Please try again.",
       model: null,
+      tokensUsed: 0,
+      durationMs: 0,
       createdAt: new Date("2026-01-03T00:00:00.000Z"),
     })
     const meta = await getRepoAnalysisStatus("repo-1", "user-1")

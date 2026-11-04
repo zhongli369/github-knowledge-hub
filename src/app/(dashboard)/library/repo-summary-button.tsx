@@ -11,6 +11,7 @@ import {
   Clock,
   CheckCircle2,
   Cpu,
+  Hash,
 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { useLanguage } from "@/i18n/LanguageProvider"
@@ -39,6 +40,11 @@ function formatDate(iso: string): string {
 function formatTime(iso: string): string {
   const d = new Date(iso)
   return d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`
+  return `${(ms / 1000).toFixed(1)}s`
 }
 
 // ── Section ──────────────────────────────────────────────────────
@@ -247,6 +253,18 @@ export function RepoSummaryButton({ repoId, initialStatus, batchGenerating }: Pr
                 <span className="inline-flex items-center gap-1">
                   <Cpu className="size-3" />
                   {meta.model}
+                </span>
+              )}
+              {meta.tokensUsed > 0 && (
+                <span className="inline-flex items-center gap-1">
+                  <Hash className="size-3" />
+                  {meta.tokensUsed.toLocaleString()} {t.analyses.tokens}
+                </span>
+              )}
+              {meta.durationMs > 0 && (
+                <span className="inline-flex items-center gap-1">
+                  <Clock className="size-3" />
+                  {formatDuration(meta.durationMs)}
                 </span>
               )}
               <span className="inline-flex items-center gap-1 text-green-700">

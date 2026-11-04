@@ -226,6 +226,9 @@ export interface FailOptions {
   now?: Date
   error: string
   maxAttempts?: number
+  /** Persist measured cost/latency so failed tasks are still observable. */
+  durationMs?: number
+  tokensUsed?: number
 }
 
 /**
@@ -246,6 +249,8 @@ export async function failAnalysis(options: FailOptions): Promise<boolean> {
        "workerId" = CASE WHEN "attempts" >= $5 THEN "workerId" ELSE NULL END,
        "leaseExpiresAt" = NULL,
        "claimedAt" = NULL,
+       "tokensUsed" = COALESCE($6, "tokensUsed"),
+       "durationMs" = COALESCE($7, "durationMs"),
        "updatedAt" = $3
      WHERE "id" = $1
        AND "workerId" = $2
@@ -256,6 +261,8 @@ export async function failAnalysis(options: FailOptions): Promise<boolean> {
     now,
     options.error.slice(0, 1000),
     maxAttempts,
+    options.tokensUsed ?? null,
+    options.durationMs ?? null,
   )
   return affected > 0
 }

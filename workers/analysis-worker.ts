@@ -13,7 +13,7 @@
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { prisma } from "@/lib/prisma"
-import { analyzeRepoSummary } from "@/services/llm/analysis.service"
+import { analyzeRepoSummary, AnalysisError } from "@/services/llm/analysis.service"
 import { extractAssetsFromRepo } from "@/services/knowledge/extraction.service"
 import { createOctokit } from "@/lib/github/client"
 import {
@@ -169,6 +169,9 @@ export async function processOne(): Promise<boolean> {
       analysisId: analysis.id,
       workerId: WORKER_ID,
       error: errMsg,
+      // Preserve the duration measured by the shared LLM call when available so
+      // a failed task still carries a meaningful durationMs.
+      durationMs: error instanceof AnalysisError ? error.durationMs : undefined,
     })
     if (!persisted) {
       console.warn(`[worker] Lost lease before failing ${analysis.id}; stale error not persisted`)

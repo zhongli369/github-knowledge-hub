@@ -23,7 +23,13 @@ vi.mock("@/lib/prisma", () => ({
     $disconnect: githubMocks.disconnect,
   },
 }))
-vi.mock("@/services/llm/analysis.service", () => ({ analyzeRepoSummary: githubMocks.analyze }))
+vi.mock("@/services/llm/analysis.service", () => ({
+  analyzeRepoSummary: githubMocks.analyze,
+  AnalysisError: class AnalysisError extends Error {
+    code = "LLM_CALL_FAILED"
+    durationMs?: number
+  },
+}))
 vi.mock("@/services/knowledge/extraction.service", () => ({ extractAssetsFromRepo: githubMocks.extract }))
 vi.mock("@/lib/github/client", () => ({ createOctokit: githubMocks.createOctokit }))
 vi.mock("@/services/analysis/leasing.service", () => leasingMocks)
