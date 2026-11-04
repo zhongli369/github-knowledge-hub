@@ -70,15 +70,31 @@ describe("token encryption at rest (integration)", () => {
 
     const stored = await prisma.account.findFirstOrThrow({
       where: { userId },
-      select: { access_token: true, refresh_token: true },
+      select: {
+        provider: true,
+        providerAccountId: true,
+        userId: true,
+        access_token: true,
+        refresh_token: true,
+      },
     })
     expect(stored.access_token).not.toBe(GITHUB_ACCESS_TOKEN)
     expect(stored.refresh_token).not.toBe(GITHUB_REFRESH_TOKEN)
     expect(isEncryptedToken(stored.access_token!)).toBe(true)
     expect(isEncryptedToken(stored.refresh_token!)).toBe(true)
 
-    expect(decryptToken(stored.access_token!)).toBe(GITHUB_ACCESS_TOKEN)
-    expect(decryptToken(stored.refresh_token!)).toBe(GITHUB_REFRESH_TOKEN)
+    expect(decryptToken(stored.access_token!, {
+      provider: stored.provider,
+      providerAccountId: stored.providerAccountId,
+      userId: stored.userId,
+      field: "access_token",
+    })).toBe(GITHUB_ACCESS_TOKEN)
+    expect(decryptToken(stored.refresh_token!, {
+      provider: stored.provider,
+      providerAccountId: stored.providerAccountId,
+      userId: stored.userId,
+      field: "refresh_token",
+    })).toBe(GITHUB_REFRESH_TOKEN)
 
     // The app's real GitHub token use point can also read this account.
     const octokit = await createOctokit(userId)
@@ -157,19 +173,45 @@ describe("token encryption at rest (integration)", () => {
     await migrateAccounts(prisma, { execute: true })
     const migrated = await prisma.account.findUniqueOrThrow({
       where: { id: accountId },
-      select: { access_token: true, refresh_token: true },
+      select: {
+        provider: true,
+        providerAccountId: true,
+        userId: true,
+        access_token: true,
+        refresh_token: true,
+      },
     })
     expect(isEncryptedToken(migrated.access_token!)).toBe(true)
-    expect(decryptToken(migrated.access_token!)).toBe("ghp_legacy_migrate_456")
-    expect(decryptToken(migrated.refresh_token!)).toBe("ghr_legacy_migrate_789")
+    expect(decryptToken(migrated.access_token!, {
+      provider: migrated.provider,
+      providerAccountId: migrated.providerAccountId,
+      userId: migrated.userId,
+      field: "access_token",
+    })).toBe("ghp_legacy_migrate_456")
+    expect(decryptToken(migrated.refresh_token!, {
+      provider: migrated.provider,
+      providerAccountId: migrated.providerAccountId,
+      userId: migrated.userId,
+      field: "refresh_token",
+    })).toBe("ghr_legacy_migrate_789")
 
     // Re-run: no further changes, no double encryption.
     const reRun = await migrateAccounts(prisma, { execute: true })
     expect(reRun.affected.some((account) => account.id === accountId)).toBe(false)
     const after = await prisma.account.findUniqueOrThrow({
       where: { id: accountId },
-      select: { access_token: true },
+      select: {
+        provider: true,
+        providerAccountId: true,
+        userId: true,
+        access_token: true,
+      },
     })
-    expect(decryptToken(after.access_token!)).toBe("ghp_legacy_migrate_456")
+    expect(decryptToken(after.access_token!, {
+      provider: after.provider,
+      providerAccountId: after.providerAccountId,
+      userId: after.userId,
+      field: "access_token",
+    })).toBe("ghp_legacy_migrate_456")
   })
 })

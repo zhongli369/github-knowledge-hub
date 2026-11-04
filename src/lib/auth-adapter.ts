@@ -2,7 +2,13 @@ import { PrismaAdapter } from "@auth/prisma-adapter"
 import type { Adapter, AdapterAccount } from "@auth/core/adapters"
 
 import { prisma } from "@/lib/prisma"
-import { decryptToken, encryptToken, isEncryptedToken } from "@/lib/encryption"
+import {
+  decryptToken,
+  encryptToken,
+  isEncryptedToken,
+  type TokenContext,
+  type TokenField,
+} from "@/lib/encryption"
 
 /**
  * Wraps the official Prisma adapter so that every OAuth Account write goes
@@ -25,6 +31,20 @@ type AdapterAccountTokens = AdapterAccount & {
 }
 
 /**
+ * Builds the Account context that v2 ciphertext is cryptographically bound to.
+ * The adapter owns the authoritative provider / providerAccountId / userId, so
+ * it always supplies a full context for encrypt/decrypt.
+ */
+function tokenContextFor(account: AdapterAccountTokens, field: TokenField): TokenContext {
+  return {
+    provider: account.provider ?? "",
+    providerAccountId: account.providerAccountId ?? "",
+    userId: account.userId ?? "",
+    field,
+  }
+}
+
+/**
  * Returns a copy of an auth account with `access_token`/`refresh_token`
  * encrypted when they are present and not already encrypted. A missing
  * `TOKEN_ENCRYPTION_KEY` makes encryption throw, so a plaintext token is never
@@ -36,7 +56,7 @@ export async function encryptAccountTokens(account: AdapterAccount): Promise<Ada
     const value = copy[field]
     // Skip already-encrypted values so a re-run never double-encrypts.
     if (value && !isEncryptedToken(value)) {
-      copy[field] = encryptToken(value)
+      copy[field] = encryptToken(value, tokenContextFor(copy, field))
     }
   }
   return copy
@@ -45,13 +65,15 @@ export async function encryptAccountTokens(account: AdapterAccount): Promise<Ada
 /**
  * Returns a copy of an auth account with `access_token`/`refresh_token`
  * decrypted when they are ciphertext. Legacy plaintext tokens are left as-is.
+ * v2 ciphertext requires the full Account context and fails closed when it is
+ * missing.
  */
 export async function decryptAccountTokens(account: AdapterAccount): Promise<AdapterAccount> {
   const copy: AdapterAccountTokens = { ...account }
   for (const field of ENCRYPTED_ACCOUNT_FIELDS) {
     const value = copy[field]
     if (value && isEncryptedToken(value)) {
-      copy[field] = decryptToken(value)
+      copy[field] = decryptToken(value, tokenContextFor(copy, field))
     }
   }
   return copy

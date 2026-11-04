@@ -18,7 +18,8 @@ env:
   AUTH_GITHUB_ID: ci-dummy-github-client-id
   AUTH_GITHUB_SECRET: ci-dummy-github-client-secret
   OPENAI_API_KEY: ci-dummy-openai-api-key
-  TOKEN_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+  # TOKEN_ENCRYPTION_KEY is intentionally not hardcoded here: the real key must
+  # be unique per run, so each job generates an ephemeral one just for tests.
 
 jobs:
   check:
@@ -27,6 +28,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Generate ephemeral token encryption key
+        run: echo "TOKEN_ENCRYPTION_KEY=$(openssl rand -base64 32)" >> "$GITHUB_ENV"
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -53,6 +56,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Generate ephemeral token encryption key
+        run: echo "TOKEN_ENCRYPTION_KEY=$(openssl rand -base64 32)" >> "$GITHUB_ENV"
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
