@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { spawnSync } from "node:child_process"
@@ -29,6 +29,30 @@ const runId = `${Date.now()}_${process.pid}`
 const createdDatabases = []
 let legacySchemaPath = null
 
+const integrationTestDir = path.join(root, "tests", "integration")
+const integrationTestFiles = readdirSync(integrationTestDir)
+  .filter((file) => file.endsWith(".test.ts"))
+  .sort()
+if (integrationTestFiles.length === 0) {
+  throw new Error(`No integration test files found in ${integrationTestDir}`)
+}
+
+/**
+ * Every integration test file runs against its OWN freshly-created database.
+ * Files share nothing, so a failed or mid-run suite can never pollute the next
+ * file's assertions. Database names keep the `gkh_test_<label>_<digits>_<digits>`
+ * shape that the integration suites' safety guards validate.
+ */
+function dbName(label, runSegment = runId) {
+  return `gkh_test_${label}_${runSegment}`
+}
+
+function dbUrl(name) {
+  const url = new URL(baseUrl)
+  url.pathname = `/${name}`
+  return url.toString()
+}
+
 function run(command, args, env = process.env) {
   console.log(`\n> ${command} ${args.join(" ")}`)
   const result = spawnSync(command, args, { cwd: root, env, stdio: "inherit" })
@@ -43,13 +67,22 @@ function dockerDatabase(tool, databaseName) {
   run("docker", ["exec", container, tool, "-U", databaseUser, databaseName])
 }
 
-function createDatabase(label) {
-  const name = `gkh_test_${label}_${runId}`
-  const url = new URL(baseUrl)
-  url.pathname = `/${name}`
+function createDatabase(label, runSegment = runId) {
+  const name = dbName(label, runSegment)
   dockerDatabase("createdb", name)
   createdDatabases.push(name)
-  return { name, url: url.toString() }
+  return { name, url: dbUrl(name) }
+}
+
+/** Clones the already-migrated fresh template so all files share one migration deploy. */
+function cloneFreshDatabase(template, index) {
+  const name = dbName("fresh", `${Date.now()}${String(index + 1).padStart(2, "0")}_${process.pid}`)
+  if (!/^gkh_test_fresh_\d+_\d+$/.test(name)) {
+    throw new Error(`Refusing unexpected fresh test database name: ${name}`)
+  }
+  run("docker", ["exec", container, "createdb", "-U", databaseUser, "-T", template.name, name])
+  createdDatabases.push(name)
+  return { name, url: dbUrl(name) }
 }
 
 function environmentFor(database) {
@@ -94,15 +127,31 @@ async function seedLegacyDatabase(database) {
 
 let exitCode = 0
 try {
-  const fresh = createDatabase("fresh")
-  run(process.execPath, ["scripts/db-migrate.mjs", "deploy"], environmentFor(fresh))
+  // 1) One fresh "template" database that receives the real Prisma migrations.
+  const template = createDatabase("fresh")
+  run(process.execPath, ["scripts/db-migrate.mjs", "deploy"], environmentFor(template))
 
+  // 2) Every integration test file gets its own clone so suites are fully
+  //    isolated from each other (no shared rows, no cross-file pollution).
+  const fileDatabases = new Map()
+  integrationTestFiles.forEach((file, index) => {
+    const database = cloneFreshDatabase(template, index)
+    fileDatabases.set(path.join("tests", "integration", file), database)
+  })
+
+  // 3) The legacy database is derived, pushed, seeded and baselined once.
   const legacy = createDatabase("legacy")
   const runtimeDir = path.join(root, ".run")
   mkdirSync(runtimeDir, { recursive: true })
   legacySchemaPath = path.join(runtimeDir, `legacy-schema-${runId}.prisma`)
   const currentSchema = readFileSync(path.join(root, "prisma", "schema.prisma"), "utf8")
   const legacySchema = currentSchema
+    // Recreate the pre-user-isolation identity constraints. The upgrade
+    // migration must be rehearsed from the actual old global uniques, not from
+    // a database that already has the new compound keys.
+    .replace(/^  githubId\s+Int\r?$/m, "  githubId        Int              @unique")
+    .replace(/^  fullName\s+String\r?$/m, "  fullName        String           @unique")
+    .replace(/^  @@unique\(\[userId, (?:githubId|fullName)\]\)\r?\n/gm, "")
     .replace(
       /  \/\/ Stored generated column[^\n]*\n  searchVector[^\n]*/,
       '  searchVector    Unsupported("tsvector")?',
@@ -117,7 +166,10 @@ try {
     legacySchema === currentSchema ||
     legacySchema.includes("@@index([searchVector]") ||
     legacySchema.includes("leaseExpiresAt") ||
-    legacySchema.includes("@@index([status, leaseExpiresAt]")
+    legacySchema.includes("@@index([status, leaseExpiresAt]") ||
+    legacySchema.includes("@@unique([userId, githubId]") ||
+    !legacySchema.includes("githubId        Int              @unique") ||
+    !legacySchema.includes("fullName        String           @unique")
   ) {
     throw new Error("Could not derive the legacy Prisma schema fixture")
   }
@@ -126,13 +178,26 @@ try {
   await seedLegacyDatabase(legacy)
   run(process.execPath, ["scripts/db-migrate.mjs", "baseline", "--execute"], environmentFor(legacy))
 
-  const testEnvironment = {
-    ...environmentFor(fresh),
-    GKH_TEST_FRESH_DATABASE_URL: fresh.url,
-    GKH_TEST_LEGACY_DATABASE_URL: legacy.url,
-    GKH_TEST_RUNTIME_ID: runId,
+  // 4) Run each integration test file serially against its own database. A
+  //    failure in one file aborts nothing; the remaining suites still run and
+  //    the overall exit code reflects any file that failed.
+  for (const file of integrationTestFiles) {
+    const filePath = path.join("tests", "integration", file)
+    const database = fileDatabases.get(filePath)
+    if (!database) throw new Error(`No isolated database was prepared for ${filePath}`)
+    const testEnvironment = {
+      ...environmentFor(database),
+      GKH_TEST_FRESH_DATABASE_URL: database.url,
+      GKH_TEST_LEGACY_DATABASE_URL: legacy.url,
+      GKH_TEST_RUNTIME_ID: runId,
+    }
+    try {
+      run(process.execPath, ["node_modules/vitest/vitest.mjs", "run", "--config", "vitest.integration.config.ts", filePath], testEnvironment)
+    } catch (error) {
+      console.error(`\nIntegration test file failed: ${file}\n${error.message}`)
+      exitCode = 1
+    }
   }
-  run(process.execPath, ["node_modules/vitest/vitest.mjs", "run", "--config", "vitest.integration.config.ts"], testEnvironment)
 } catch (error) {
   console.error(`\nIntegration test failure: ${error.message}`)
   exitCode = 1
