@@ -3,10 +3,14 @@
 import { useState, useCallback, useTransition } from "react"
 import { useRouter } from "next/navigation"
 import Link from "next/link"
-import { Plus, Trash2, Loader2, Layers } from "lucide-react"
+import { Plus, Trash2, Loader2, Layers, Pencil, Check } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { useLanguage } from "@/i18n/LanguageProvider"
-import { createCollectionAction, deleteCollectionAction } from "@/actions/collections"
+import {
+  createCollectionAction,
+  deleteCollectionAction,
+  updateCollectionAction,
+} from "@/actions/collections"
 
 interface CollectionItem {
   id: string
@@ -29,6 +33,9 @@ export function CollectionsClient({
   const [creating, setCreating] = useState(false)
   const [name, setName] = useState("")
   const [description, setDescription] = useState("")
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [editName, setEditName] = useState("")
+  const [editDescription, setEditDescription] = useState("")
   const [isPending, startTransition] = useTransition()
 
   const handleCreate = useCallback(() => {
@@ -61,6 +68,34 @@ export function CollectionsClient({
       })
     },
     [router, t.collections.deleteConfirm]
+  )
+
+  const startEdit = useCallback((collection: CollectionItem) => {
+    setEditingId(collection.id)
+    setEditName(collection.name)
+    setEditDescription(collection.description ?? "")
+  }, [])
+
+  const handleUpdate = useCallback(
+    (collection: CollectionItem) => {
+      if (!editName.trim()) return
+      startTransition(async () => {
+        const updated = await updateCollectionAction(collection.id, {
+          name: editName.trim(),
+          description: editDescription.trim() || null,
+        })
+        setCollections((prev) =>
+          prev.map((c) =>
+            c.id === collection.id
+              ? { ...c, name: updated.name, description: updated.description }
+              : c
+          )
+        )
+        setEditingId(null)
+        router.refresh()
+      })
+    },
+    [editName, editDescription, router]
   )
 
   if (forceEmpty && collections.length === 0) {
@@ -158,35 +193,83 @@ export function CollectionsClient({
       <div className="grid gap-3 md:grid-cols-2">
         {collections.map((c) => (
           <div key={c.id} className="rounded-lg border p-4 space-y-2">
-            <div className="flex items-start justify-between gap-2">
-              <Link
-                href={`/collections/${c.id}`}
-                className="font-medium text-sm hover:underline"
-              >
-                {c.name}
-              </Link>
-              <button
-                onClick={() => handleDelete(c)}
-                className="text-muted-foreground hover:text-destructive shrink-0"
-              >
-                <Trash2 className="size-3.5" />
-              </button>
-            </div>
-            {c.description && (
-              <p className="text-xs text-muted-foreground line-clamp-2">{c.description}</p>
+            {editingId === c.id ? (
+              <div className="space-y-2">
+                <input
+                  type="text"
+                  value={editName}
+                  onChange={(e) => setEditName(e.target.value)}
+                  placeholder={t.collections.name}
+                  className="w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                  autoFocus
+                />
+                <input
+                  type="text"
+                  value={editDescription}
+                  onChange={(e) => setEditDescription(e.target.value)}
+                  placeholder={t.collections.descriptionLabel}
+                  className="w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                />
+                <div className="flex gap-2">
+                  <Button
+                    size="sm"
+                    onClick={() => handleUpdate(c)}
+                    disabled={!editName.trim() || isPending}
+                  >
+                    {isPending ? (
+                      <Loader2 className="size-3.5 animate-spin mr-1" />
+                    ) : (
+                      <Check className="size-3.5 mr-1" />
+                    )}
+                    {t.common.save}
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => setEditingId(null)}>
+                    {t.common.cancel}
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="flex items-start justify-between gap-2">
+                  <Link
+                    href={`/collections/${c.id}`}
+                    className="font-medium text-sm hover:underline"
+                  >
+                    {c.name}
+                  </Link>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button
+                      onClick={() => startEdit(c)}
+                      className="text-muted-foreground hover:text-foreground"
+                      title={t.collections.edit}
+                    >
+                      <Pencil className="size-3.5" />
+                    </button>
+                    <button
+                      onClick={() => handleDelete(c)}
+                      className="text-muted-foreground hover:text-destructive"
+                    >
+                      <Trash2 className="size-3.5" />
+                    </button>
+                  </div>
+                </div>
+                {c.description && (
+                  <p className="text-xs text-muted-foreground line-clamp-2">{c.description}</p>
+                )}
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <span>
+                    <strong className="text-foreground">{c._count.assets}</strong> {t.collections.assetsCount}
+                  </span>
+                  <span>
+                    {t.collections.updated}{" "}
+                    {new Date(c.updatedAt).toLocaleDateString("zh-CN", {
+                      month: "short",
+                      day: "numeric",
+                    })}
+                  </span>
+                </div>
+              </>
             )}
-            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <span>
-                <strong className="text-foreground">{c._count.assets}</strong> {t.collections.assetsCount}
-              </span>
-              <span>
-                {t.collections.updated}{" "}
-                {new Date(c.updatedAt).toLocaleDateString("zh-CN", {
-                  month: "short",
-                  day: "numeric",
-                })}
-              </span>
-            </div>
           </div>
         ))}
       </div>

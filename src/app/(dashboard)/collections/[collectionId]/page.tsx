@@ -30,7 +30,7 @@ export default async function CollectionDetailPage({
     include: {
       assets: {
         include: { asset: true },
-        orderBy: { addedAt: "desc" },
+        orderBy: [{ sortOrder: "asc" }, { addedAt: "desc" }],
       },
     },
   })
@@ -47,19 +47,11 @@ export default async function CollectionDetailPage({
         {t.common.backToCollections}
       </Link>
 
-      <div>
-        <h1 className="text-2xl font-bold tracking-tight">{collection.name}</h1>
-        {collection.description && (
-          <p className="text-muted-foreground mt-1">{collection.description}</p>
-        )}
-        <p className="text-xs text-muted-foreground mt-1">
-          {collection.assets.length} {t.collections.assetsCount}
-        </p>
-      </div>
-
       <Suspense fallback={<p className="text-muted-foreground">{t.common.loading}</p>}>
         <CollectionDetailClient
           collectionId={collection.id}
+          initialName={collection.name}
+          initialDescription={collection.description}
           initialAssets={collection.assets.map((ca) => ({
             ...ca.asset,
             addedAt: ca.addedAt.toISOString(),
