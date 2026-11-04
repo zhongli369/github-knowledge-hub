@@ -1,8 +1,8 @@
 # GitHub Knowledge Hub 开发路线图
 
-> 基线日期：2026-11-03  
+> 基线日期：2026-11-03；P1 更新：2026-11-04
 > 原则：先保证可恢复、可迁移、可验证，再扩展 AI 和分享功能。  
-> 状态口径：各节“现状”保留任务起点；完成状态以 2026-11-03 P0 快照和实际验证为准。
+> 状态口径：各节“现状”保留任务起点；完成状态以 P0/P1 快照和实际验证为准。
 
 ## 2026-11-03 P0 完成快照
 
@@ -10,7 +10,16 @@
 - P0-2：完整数据库备份、隔离恢复、真实备份副本无损升级和真实 migration 均完成；generated stored `searchVector` + GIN 正常。
 - P0-3：新环境 `migrate deploy` 与旧 `db push` 环境 baseline 均有版本化 migration 和隔离测试；真实库 migration status 为 up to date，Prisma drift 为空。
 - P0-4：8 个单元测试、13 个隔离集成测试通过；真实桌面 Web+Worker HTTP 200，重复启动不产生重复进程。
-- 真实 OAuth、真实 LLM/Embedding、完整资产提取链和更多业务领域回归仍未重验；CI、Token 加密和 Worker 原子领取属于后续 P1。
+- P0 时尚未重验真实 OAuth、真实 LLM/Embedding、完整资产提取链和更多业务领域回归；最新验证边界见 P1 快照。
+
+## 2026-11-04 P1 完成快照
+
+- P1-1：Auth.js Prisma Adapter 的真实 `linkAccount` 写入链已接入 AES-256-GCM，access/refresh Token 均加密，旧明文兼容；错误 key/损坏密文显式失败。本地持久 key 已配置，**真实存量 Account Token 未迁移**，真实 OAuth/重新授权/refresh 尚未重验。
+- P1-2：Worker 已实现 `FOR UPDATE SKIP LOCKED` 原子领取、60 秒 lease、20 秒 heartbeat、最多 3 次 attempts、过期恢复和 stale-write 防护；多 Worker 在真实隔离 PostgreSQL 中通过竞争测试。
+- P1-3：集中验证为 110 个单元测试 + 41 个隔离集成测试通过，typecheck、Prisma validate、build 通过。GitHub Actions 双 jobs 已版本化，远程运行结果以 Actions 记录为准。
+- P1-4：README、维护指南、架构文档和 `.env.example` 已同步 Token key、轮换、leasing、第三条 migration 与验证边界。
+- 真实 Docker 数据库已备份并只应用 leasing migration；219 个 Repository、2 条 Analysis 保留，0 个 pending/running，Prisma drift 为空。真实桌面 Web+Worker 已恢复。
+- 真实 OAuth、GitHub 同步、LLM/Embedding provider、完整外部资产提取链和人工浏览器回归仍未重验；Mock/隔离测试不等于真实服务验收。
 
 ## 优先级定义
 
@@ -156,7 +165,9 @@
 
 ### P1-1 GitHub OAuth Token 安全存储
 
-**现状**
+**完成状态：新 Account 写入加密与隔离验收已完成；真实存量 Token 未迁移，真实 OAuth/refresh 未重验。**
+
+**现状（任务起点）**
 
 - Octokit 从 `Account.access_token` 获取用户 Token。
 - `encryptToken()` 未发现调用方；`decryptToken()` 对 GitHub 格式 Token 直接按明文返回。
@@ -182,7 +193,9 @@
 
 ### P1-2 Worker 原子任务领取
 
-**现状**
+**完成状态：原子领取、lease/heartbeat/attempts、过期恢复与 stale-write 防护已完成，并通过真实隔离 PostgreSQL 多 Worker 测试。**
+
+**现状（任务起点）**
 
 - Worker 先 `findFirst(pending)`，再按 id 更新为 running，注释称原子但存在两个独立操作。
 - 单进程有并发限制，多进程之间没有互斥和租约恢复。
@@ -207,7 +220,9 @@
 
 ### P1-3 自动化测试与 GitHub Actions CI
 
-**现状**
+**完成状态：110 个单元测试、41 个隔离集成测试及静态检查/build 通过；Actions 双 jobs 已版本化，远程状态单独核对。**
+
+**现状（任务起点）**
 
 - 已有 Vitest 单元测试和隔离 PostgreSQL 集成测试，但无 GitHub Actions。
 - TypeScript、Prisma validate、ESLint、test 和 build 可本地运行，尚缺统一远程质量门。
@@ -232,7 +247,9 @@
 
 ### P1-4 README、CLAUDE.md、环境变量文档同步
 
-**现状**
+**完成状态：README、维护文档与 `.env.example` 已同步 P1 实际代码、配置和验证边界。**
+
+**现状（任务起点）**
 
 - README 与三份维护文档已同步 P0；`.env.example`、源码 TODO 和 Phase 注释仍需继续清理。
 - `.env.example` 仍写 Phase 5 未启用，部分变量说明与代码读取不一致。
@@ -307,10 +324,11 @@
 
 1. ~~Git/安全备份与敏感信息审计~~（已完成，提交前持续复查）。
 2. ~~全文搜索和 Prisma migration 基线~~（已完成）。
-3. ~~本轮启动及核心 smoke test~~（已完成）。
-4. Token 加密与 Worker 原子领取。
-5. CI 和剩余文档/环境模板一致性。
-6. difficulty、遥测、收藏集和统一摘要链。
+3. ~~启动及核心 smoke test~~（已完成）。
+4. ~~Token 新写入加密与 Worker 原子领取/leasing~~（代码和隔离验收已完成；真实存量 Token 迁移另行受控执行）。
+5. ~~CI 配置和文档/环境模板一致性~~（已完成；远程 Actions 状态单独核对）。
+6. 统一摘要执行链 → difficulty 持久化 → tokensUsed/durationMs 遥测。
+7. 收藏集编辑/分享与生产部署按实际需求另行排期。
 
 ## 每项任务的完成定义
 

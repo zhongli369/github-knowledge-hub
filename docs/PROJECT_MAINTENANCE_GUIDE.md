@@ -1,6 +1,6 @@
 # GitHub Knowledge Hub 项目维护指南
 
-> 整理日期：2026-11-03  
+> 整理日期：2026-11-03；P1 更新：2026-11-04
 > 依据：当前源码、隔离测试、真实备份恢复演练、真实 migration 与本地启动验证。
 > 本文用于长期维护，不代表所有功能均已在整理当日重新完成端到端验收。
 
@@ -40,13 +40,39 @@ GitHub Knowledge Hub 是一个个人 GitHub 知识管理工作台，核心链路
 - `scripts/start-desktop.ps1` 在真实 migration 状态下启动 Web 和 Worker；`http://localhost:3000` 返回 HTTP 200。
 - 第二次启动保留相同 Web/Worker PID，没有重复实例；Worker 显示 started，Web/Worker 错误日志均为空。两个 Analysis 均为 completed，启动时未领取真实任务。
 
-### 2.3 尚未完成的真实端到端验证
+### 2.3 P1 冲刺后的实际验证（2026-11-04）
 
-- GitHub OAuth 完整登录回调。
+**集中验证**
+
+- Prisma Client generate、`npx prisma validate`、`npm run typecheck`、Next.js build 通过；build 生成 11 个静态页面。
+- `npm test`：10 个文件、110 个单元测试通过，无真实外部网络调用。
+- `npm run test:integration`：7 个文件、41 个隔离 PostgreSQL 测试通过，包含真实多 Worker 竞争、Token Adapter 落库、migration、搜索和业务链；外部 GitHub/LLM/Embedding 使用 Mock。
+- ESLint 为 0 errors；仅保留 `analysis.service.ts` 原有的 1 个 `_opts` unused warning。
+- `.github/workflows/ci.yml` 已建立 Ubuntu 双 jobs（静态检查/build 与 PostgreSQL/pgvector 集成测试）；远程 Actions 结果以 GitHub 实际运行记录为准，不能由本地结果替代。
+
+**Token 安全**
+
+- `src/lib/auth-adapter.ts` 包装官方 Prisma Adapter，真实 `linkAccount` 写入路径同时加密 `access_token` 与 `refresh_token`；`getAccount` 读取时解密，Octokit 使用点也统一解密。
+- 密文采用 AES-256-GCM、12-byte 随机 IV、16-byte authentication tag，格式为 `enc:v1:<keyId>:<base64(iv || tag || ciphertext)>`。错误 key、未知 key id、损坏密文显式失败，不输出 Token 或完整密文。
+- 新写入缺少 `TOKEN_ENCRYPTION_KEY` 时 fail closed；识别出的旧 GitHub 明文仍可读取。本地 `.env` 已持久配置随机 32-byte key，重载验证通过，密钥值未进入日志、文档或 Git。
+- `scripts/migrate-token-encryption.mjs` 默认 dry-run，`--execute` 才写入，支持幂等跳过和写前 roundtrip。**真实 Account 存量 Token 未执行迁移**，因此不能宣称真实数据库/备份已无明文 Token。
+
+**Worker 与真实数据库**
+
+- Worker 使用单条 `UPDATE ... SELECT ... FOR UPDATE SKIP LOCKED ... RETURNING` 原子领取；60 秒 lease、20 秒 heartbeat、最多 3 次 attempts。过期任务可恢复，耗尽 attempts 后 terminal failed，stale worker 的 renew/complete/fail 均被拒绝。
+- 多 Worker 真实 PostgreSQL 竞争、lease 恢复、最大 attempts、stale-write 和并发资产唯一性均在隔离库通过；这不等于真实外部 LLM/Embedding 验收。
+- P1 升级前备份：`db-backups/gkh-p1-20261104-113807.dump`，70,616 bytes，SHA-256 `bdaafada8a07c10133bb142ad928dcf1c2fdb2a3b538fe073305267298e7d036`；`pg_restore --list` 通过。
+- 真实 Docker 数据库在 Web/Worker 停止后只应用 `20261104101530_analysis_worker_leasing`。升级后为 219 个 Repository、2 条 Analysis、0 个 pending/running，三条 migration 均成功，Prisma drift 为空。未 reset、未删除 Volume、未迁移真实 Token。
+- 真实桌面 Web+Worker 已恢复，启动器确认 `http://localhost:3000` 可访问；启动时没有待执行任务，因此未触发真实付费 LLM 调用。
+
+### 2.4 尚未完成的真实端到端验证
+
+- GitHub OAuth 完整登录回调、重新授权与 Token refresh。
+- 真实存量 Account Token 加密迁移（脚本仅在隔离假数据上执行）。
 - 我的仓库/Starred 仓库真实同步。
 - OpenAI/DeepSeek 真实 LLM 请求。
 - Embedding 真实生成与语义搜索。
-- 知识资产提取 Worker 的完整任务链。
+- 知识资产提取 Worker 的完整外部任务链。
 - 收藏集和笔记的人工浏览器回归。
 
 旧文档记录 2026-05-27 OAuth E2E 曾通过，但不能替代当前环境的重新验收。
@@ -70,7 +96,7 @@ GitHub Knowledge Hub 是一个个人 GitHub 知识管理工作台，核心链路
 | Discover | `hybrid/semantic/keyword` 三模式；语言、最低 Star、Topic 筛选；相似仓库 | `src/services/llm/repo-embedding.service.ts` |
 | Collections | 创建/删除收藏集，添加/移除知识资产，查看收藏详情 | `src/actions/collections.ts` |
 | Analyses | 最近 50 条分析，按类型和状态筛选，显示模型与错误 | `src/services/llm/analysis.service.ts` |
-| Worker | 5 秒轮询，单进程最多 3 并发；处理 `repo_summary` 和 `asset_extraction` | `workers/analysis-worker.ts` |
+| Worker | 5 秒轮询；数据库原子领取、60 秒 lease、20 秒 heartbeat、最多 3 次 attempts；处理 `repo_summary` 和 `asset_extraction` | `workers/analysis-worker.ts`、`src/services/analysis/leasing.service.ts` |
 | 中英文/主题 | Cookie 保存中英文偏好；next-themes 支持系统主题 | `src/i18n/`、`src/components/providers.tsx` |
 
 ### 3.2 两条 AI 执行链
@@ -94,7 +120,7 @@ GitHub Knowledge Hub 是一个个人 GitHub 知识管理工作台，核心链路
 - 收藏集重命名、描述编辑和公开分享未完整实现。
 - GitHub Code Search、按 Topic 搜索 GitHub 的服务函数没有独立用户页面。
 - 没有通用业务 REST API；业务交互主要使用 Server Actions。
-- 没有生产级多 Worker 调度、公开多租户分享或完整 CI/CD。
+- 已有 GitHub Actions CI，但没有生产级 Worker supervisor、公开多租户分享或 CD/生产部署链。
 
 ## 4. 核心技术栈
 
@@ -125,7 +151,7 @@ flowchart LR
 
     subgraph NodeHost["Windows 主机：Node.js"]
         Web["Next.js Web<br/>页面 + Server Actions"]
-        Worker["analysis-worker.ts<br/>5 秒轮询，最多 3 并发"]
+        Worker["analysis-worker.ts<br/>5 秒轮询，原子 lease + heartbeat"]
     end
 
     subgraph Docker["Docker Desktop"]
@@ -172,8 +198,10 @@ sequenceDiagram
     Auth-->>User: 未登录则跳转 GitHub OAuth
     User->>GitHub: 授权 read:user/user:email/repo
     GitHub-->>Auth: OAuth 回调与 Account Token
-    Auth->>DB: 保存 User/Account/Session
+    Auth->>Auth: 加密 Adapter 处理 access/refresh Token
+    Auth->>DB: 保存 User/加密 Account/Session
     User->>Web: Sync My Repos / Sync Starred
+    Web->>DB: 读取 Account 并解密 Token
     Web->>GitHub: Octokit 获取仓库
     GitHub-->>Web: 仓库元数据
     Web->>DB: 按用户同步 Repository
@@ -223,12 +251,15 @@ sequenceDiagram
 
     User->>Web: Extract Assets
     Web->>DB: 创建 pending asset_extraction
-    Worker->>DB: 查询最老 pending 并标记 running
+    Worker->>DB: SKIP LOCKED 原子领取并写入 lease/attempts
+    loop 执行期间
+        Worker->>DB: 每 20 秒按 workerId + 有效 lease 续租
+    end
     Worker->>GitHub: 获取文件树和源码
     Worker->>LLM: 可选代码模式分析
-    Worker->>DB: 创建 KnowledgeAsset
+    Worker->>DB: 创建 KnowledgeAsset（唯一约束防重）
     Worker->>LLM: 尽力生成资产 Embedding
-    Worker->>DB: 保存 completed / failed 与结果
+    Worker->>DB: 按 ownership + lease 条件保存 completed / failed
     User->>Web: 查看资产和分析状态
 ```
 
@@ -256,7 +287,7 @@ User
 - `RepoEmbedding`：保存仓库向量及 `textHash`，用于新鲜度判断。
 - `CollectionAsset`：Collection 与 KnowledgeAsset 的多对多连接表。
 
-schema 入口：`prisma/schema.prisma`。migration 入口：`prisma/migrations/20261103230000_init/` 与 `20261103231000_repository_search_vector/`。`searchVector` 在 Prisma 中声明为 `@default(dbgenerated())` 和 GIN index，实际 generated 表达式由 SQL migration 管理。
+schema 入口：`prisma/schema.prisma`。migration 入口：`prisma/migrations/20261103230000_init/`、`20261103231000_repository_search_vector/` 与 `20261104101530_analysis_worker_leasing/`。`searchVector` 在 Prisma 中声明为 `@default(dbgenerated())` 和 GIN index，实际 generated 表达式由 SQL migration 管理；leasing migration 新增四个 Analysis 字段、索引并为旧 running 行回填过期 lease。
 
 ## 8. Windows + Docker 本地部署
 
@@ -275,7 +306,7 @@ npm run db:deploy
 npm run dev:all
 ```
 
-`db:deploy` 应用完整初始 migration 和 searchVector 增量 migration，并检查 generated/GIN/migration 历史。新环境不需要 `db push`。
+`db:deploy` 应用初始、searchVector 和 Worker leasing 三条 migration，并检查 generated/GIN、leasing 字段/索引和 migration 历史。新环境不需要 `db push`。
 
 **既有 `db push` 数据库：** 必须先备份、隔离恢复并审查差异。以下命令不得对未核实的非空库直接执行：
 
@@ -284,7 +315,7 @@ npm run db:baseline       # dry-run；不写 migration 历史
 npm run db:baseline:apply # 显式应用 baseline + 增量 migration
 ```
 
-baseline 脚本会拒绝：已有 `_prisma_migrations`、非普通 `searchVector`、既有 search GIN、或除待建 GIN 外的 Prisma schema 差异。只有检查通过才会 `migrate resolve --applied 20261103230000_init`，随后 `migrate deploy`。若增量阶段失败，修复后使用 `npm run db:deploy`，不要重复 baseline。
+baseline 脚本会拒绝：已有 `_prisma_migrations`、非普通 `searchVector`、既有 search GIN、或除待建 search GIN 与 leasing 字段/索引外的 Prisma schema 差异。只有检查通过才会 `migrate resolve --applied 20261103230000_init`，随后 `migrate deploy`。若增量阶段失败，修复后使用 `npm run db:deploy`，不要重复 baseline。
 
 **当前真实 Docker 数据库已完成此过程，后续只需：**
 
@@ -334,10 +365,12 @@ WSL PostgreSQL 与 Docker Volume 是不同数据存储，切换时不会自动�
 | 变量 | 用途 |
 |---|---|
 | `DATABASE_URL` | Prisma PostgreSQL 连接串 |
-| `AUTH_SECRET` | Auth.js 密钥，也被现有 Token 加解密工具引用 |
+| `AUTH_SECRET` | Auth.js Session/JWT 密钥；不用于 Account Token 加解密 |
 | `AUTH_GITHUB_ID` | GitHub OAuth Client ID |
 | `AUTH_GITHUB_SECRET` | GitHub OAuth Client Secret |
 | `AUTH_URL` | 部署环境的 Auth.js 外部 URL |
+| `TOKEN_ENCRYPTION_KEY` | base64 编码的 32-byte 当前 Token key；新 Account 写入必需，必须跨重启稳定保存 |
+| `TOKEN_ENCRYPTION_KEY_PREV` | 可选旧 key，仅在轮换期间解密旧密文；旧密文全部重加密前不得删除 |
 | `OPENAI_API_KEY` | 主 LLM API Key |
 | `OPENAI_BASE_URL` | OpenAI-compatible Base URL |
 | `OPENAI_MODEL` | 主 LLM 模型；代码默认 `gpt-4o-mini` |
@@ -362,13 +395,13 @@ WSL PostgreSQL 与 Docker Volume 是不同数据存储，切换时不会自动�
 
 旧 `hybrid-search.sql` 已删除。它使用 `ADD COLUMN IF NOT EXISTS`，无法转换既有普通列；其 `array_to_string()` 也不是 PostgreSQL 接受的 immutable generated expression。现 migration 使用仅限 `text[]` 的确定性 SQL wrapper `gkh_text_array_to_string`，并以隔离测试验证 topics 搜索。不得恢复旧手工 SQL 作为日常修复手段。
 
-### P1：上线与长期维护前处理
+### P1：代码与隔离验收已完成（2026-11-04）
 
-1. GitHub OAuth Token 写入加密链未接通，`encryptToken()` 未发现调用方，解密兼容明文。
-2. Worker 的“原子领取”实际为先 `findFirst` 再 `update`，多实例可能重复处理。
-3. 已有本地单元/集成测试，仍缺少 GitHub Actions CI。
-4. README、`.env.example`、源码 TODO 和 Phase 状态存在漂移。
-5. 没有应用 Dockerfile、生产 Compose、反向代理和进程守护配置。
+1. Auth.js Prisma Adapter 的真实 `linkAccount` 写入已接入 AES-256-GCM，access/refresh Token 均加密；旧明文兼容，错误 key/损坏密文显式失败。本地持久 key 已配置；**真实存量 Account Token 未迁移，真实 OAuth/refresh 未重验**。
+2. Worker 已实现原子领取、lease/heartbeat/attempts、过期恢复和 stale-write 防护，多 Worker 真实隔离 PostgreSQL 测试通过。
+3. GitHub Actions 双 jobs 已版本化；本地 110 个单元测试、41 个集成测试、typecheck、Prisma validate 和 build 通过。远程状态以 Actions 实际记录为准。
+4. README、`.env.example` 和维护文档已同步第三条 migration、Token key/轮换、Worker leasing 与验证边界。
+5. 仍没有应用 Dockerfile、生产 Compose、反向代理和生产级进程守护配置。
 
 ### P2：功能完整性
 
@@ -386,11 +419,13 @@ WSL PostgreSQL 与 Docker Volume 是不同数据存储，切换时不会自动�
 | 页面与交互 | `src/app/(dashboard)/` |
 | Server Actions | `src/actions/` |
 | GitHub 集成 | `src/services/github/`、`src/lib/github/` |
+| OAuth Token 加密 | `src/lib/auth-adapter.ts`、`src/lib/encryption.ts`、`scripts/migrate-token-encryption.mjs` |
 | 摘要、Embedding、搜索 | `src/services/llm/` |
 | 代码资产提取 | `src/services/knowledge/` |
-| 后台任务 | `workers/analysis-worker.ts` |
+| 后台任务 | `workers/analysis-worker.ts`、`src/services/analysis/leasing.service.ts` |
 | 数据模型 | `prisma/schema.prisma` |
 | 全文搜索 migration | `prisma/migrations/20261103231000_repository_search_vector/migration.sql` |
+| Worker leasing migration | `prisma/migrations/20261104101530_analysis_worker_leasing/migration.sql` |
 | 本地启动 | `package.json`、`scripts/start-desktop.ps1` |
 | 中英文 | `src/i18n/` |
 
@@ -423,7 +458,7 @@ docker exec github-knowledge-hub-db pg_isready -U postgres -d github_knowledge_h
 npm run worker
 ```
 
-检查 `Analysis.status`、`Analysis.error` 和 Worker 控制台。生产多 Worker 前必须先修复原子任务领取。
+检查 `Analysis.status`、`Analysis.error`、`workerId`、`leaseExpiresAt`、`attempts` 和 Worker 日志。确认已应用 leasing migration，并使用包含原子领取的新 Worker；达到最大 attempts 的任务会保持 terminal failed，需要修复根因后按业务策略重新入队。
 
 ### 12.4 摘要有结果但语义搜索为空
 
