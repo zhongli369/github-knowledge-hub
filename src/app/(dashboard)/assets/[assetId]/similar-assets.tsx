@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react"
 import Link from "next/link"
+import { AlertTriangle } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { useLanguage } from "@/i18n/LanguageProvider"
 import { getSimilarAssetsAction } from "@/actions/knowledge"
@@ -29,13 +30,19 @@ const TYPE_COLORS: Record<string, string> = {
 export function SimilarAssets({ assetId }: { assetId: string }) {
   const { t } = useLanguage()
   const [results, setResults] = useState<SimilarResult[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
     let cancelled = false
     getSimilarAssetsAction(assetId)
       .then((data) => { if (!cancelled) setResults(data) })
-      .catch(() => { if (!cancelled) setResults([]) })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          setResults([])
+          setError(err instanceof Error ? err.message : "Failed to load similar assets")
+        }
+      })
       .finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
   }, [assetId])
@@ -53,7 +60,20 @@ export function SimilarAssets({ assetId }: { assetId: string }) {
     )
   }
 
-  if (!results || results.length === 0) return null
+  if (error) {
+    return (
+      <div className="flex items-center gap-1.5 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+        <AlertTriangle className="size-3.5 shrink-0" />
+        {t.assets.similarError}
+      </div>
+    )
+  }
+
+  if (!results || results.length === 0) {
+    return (
+      <p className="text-xs text-muted-foreground">{t.assets.noSimilarAssets}</p>
+    )
+  }
 
   return (
     <div className="grid gap-2">

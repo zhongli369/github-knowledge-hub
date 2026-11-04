@@ -35,11 +35,13 @@ import {
   searchSimilarAssets,
   searchByText,
   getSimilarAssets,
+  searchAssetsPage,
 } from "@/services/llm/embeddings.service"
 import {
   generateRepoEmbedding,
   checkEmbeddingFreshness,
   searchReposByText,
+  searchReposPage,
 } from "@/services/llm/repo-embedding.service"
 
 const smallVector = [0.1, 0.2]
@@ -335,5 +337,98 @@ describe("searchReposByText boundary guards", () => {
       "user-1",
       20,
     ])
+  })
+
+  it("scopes the summary LATERAL join to the current user in keyword and hybrid modes", async () => {
+    mocks.queryRawUnsafe.mockResolvedValue([{ repoId: "r1" }])
+
+    await searchReposByText("hello", "user-1", 20, undefined, "keyword")
+    const keywordSql = mocks.queryRawUnsafe.mock.calls[0][0] as string
+    // keyword params are [query, userId]; the join must read the userId at $2
+    expect(keywordSql).toMatch(/LEFT JOIN LATERAL[\s\S]*?"userId" = \$2[\s\S]*?a ON true/)
+
+    mocks.queryRawUnsafe.mockClear()
+    await searchReposByText("hello", "user-1", 20, undefined, "hybrid")
+    const hybridSql = mocks.queryRawUnsafe.mock.calls[0][0] as string
+    // hybrid params are [vector, query, userId]; the join must read the userId at $3
+    expect(hybridSql).toMatch(/LEFT JOIN LATERAL[\s\S]*?"userId" = \$3[\s\S]*?a ON true/)
+    expect(hybridSql).not.toMatch(/LEFT JOIN LATERAL[\s\S]*?"userId" = \$2[\s\S]*?a ON true/)
+  })
+})
+
+describe("search page/pageSize/threshold boundary normalization", () => {
+  it("falls back to safe defaults for NaN/Infinity page values in searchReposPage", async () => {
+    mocks.queryRawUnsafe.mockResolvedValue([])
+
+    const posInf = await searchReposPage(
+      "hello",
+      "user-1",
+      { page: Number.POSITIVE_INFINITY, pageSize: 5 },
+      "keyword",
+    )
+    expect(posInf.page).toBe(1)
+    expect(posInf.pageSize).toBe(5)
+
+    const negInfSize = await searchReposPage(
+      "hello",
+      "user-1",
+      { page: Number.NEGATIVE_INFINITY, pageSize: Number.POSITIVE_INFINITY },
+      "keyword",
+    )
+    // Infinity is not finite, so it falls back to the default pageSize (20);
+// only a finite oversized value is capped at 100.
+    expect(negInfSize.page).toBe(1)
+    expect(negInfSize.pageSize).toBe(20)
+
+    const nanBoth = await searchReposPage(
+      "hello",
+      "user-1",
+      { page: Number.NaN, pageSize: Number.NaN },
+      "keyword",
+    )
+    expect(nanBoth.page).toBe(1)
+    expect(nanBoth.pageSize).toBe(20)
+  })
+
+  it("caps searchReposPage pageSize at 100 and keeps valid page values", async () => {
+    mocks.queryRawUnsafe.mockResolvedValue([])
+
+    const r = await searchReposPage("hello", "user-1", { page: 4, pageSize: 250 }, "keyword")
+    expect(r.page).toBe(4)
+    expect(r.pageSize).toBe(100)
+
+    const r2 = await searchReposPage("hello", "user-1", { page: -3, pageSize: 0 }, "keyword")
+    expect(r2.page).toBe(1)
+    expect(r2.pageSize).toBe(1)
+  })
+
+  it("normalizes asset page/pageSize and falls back to the default threshold", async () => {
+    mocks.queryRawUnsafe.mockResolvedValue([])
+
+    const r = await searchAssetsPage("hello", "user-1", {
+      page: Number.NaN,
+      pageSize: Number.NaN,
+      threshold: Number.NaN,
+    })
+    expect(r.page).toBe(1)
+    expect(r.pageSize).toBe(20)
+
+    // No filters pushed: $1=vector, $2=userId, $3=threshold, $4=limit
+    const rowsCall = mocks.queryRawUnsafe.mock.calls[0] as [string, ...unknown[]]
+    expect(rowsCall[0]).toContain("> $3")
+    expect(rowsCall[3]).toBe(0.3)
+  })
+
+  it("clamps a finite out-of-range asset threshold into [0, 1]", async () => {
+    mocks.queryRawUnsafe.mockResolvedValue([])
+
+    await searchAssetsPage("hello", "user-1", { pageSize: 5, threshold: 99 })
+    const rowsCall = mocks.queryRawUnsafe.mock.calls[0] as [string, ...unknown[]]
+    expect(rowsCall[3]).toBe(1)
+
+    mocks.queryRawUnsafe.mockClear()
+    await searchAssetsPage("hello", "user-1", { pageSize: 5, threshold: -0.5 })
+    const clampCall = mocks.queryRawUnsafe.mock.calls[0] as [string, ...unknown[]]
+    expect(clampCall[3]).toBe(0)
   })
 })

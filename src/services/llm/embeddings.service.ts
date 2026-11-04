@@ -57,6 +57,24 @@ export interface AssetSearchResult {
   similarity: number
 }
 
+export type AssetSortKey = "relevance" | "title" | "updated"
+
+export interface AssetSearchPageResult {
+  items: AssetSearchResult[]
+  total: number
+  page: number
+  pageSize: number
+  hasMore: boolean
+}
+
+export interface AssetSearchOptions {
+  page?: number
+  pageSize?: number
+  sort?: AssetSortKey
+  filters?: AssetSearchFilters
+  threshold?: number
+}
+
 // ── Internal helper ──────────────────────────────────────────────
 
 function buildAssetFilterConditions(
@@ -83,7 +101,108 @@ function buildAssetFilterConditions(
   return conditions.length > 0 ? "AND " + conditions.join(" AND ") : ""
 }
 
+// ── Numeric boundary guard (Server Action boundary) ──────────────
+
+function normalizePage(raw: unknown): number {
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return 1
+  return Math.max(1, Math.floor(n) || 1)
+}
+
+function normalizePageSize(raw: unknown, fallback = 20): number {
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return fallback
+  return Math.min(Math.max(1, Math.floor(n)), 100)
+}
+
+function normalizeLimit(raw: unknown, fallback = 10): number {
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) return fallback
+  return Math.min(Math.floor(n), 100)
+}
+
+function normalizeThreshold(raw: unknown): number {
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return 0.3
+  return Math.min(Math.max(0, n), 1)
+}
+
 // ── Core search ──────────────────────────────────────────────────
+
+interface AssetQueryBuild {
+  rowsSql: string
+  rowsParams: unknown[]
+  countSql: string
+  countParams: unknown[]
+}
+
+const ASSET_SELECT = `
+  ka."id" AS "assetId",
+  ka."title",
+  ka."description",
+  ka."assetType",
+  ka."language",
+  ka."tags",
+  ka."difficulty",
+  ka."summary",
+  ka."sourcePath",
+  ka."repositoryId",
+  r."fullName" AS "repoFullName",
+  1 - (e."vector" <=> $1::vector) AS "similarity"`
+
+const ASSET_FROM = `
+  FROM "Embedding" e
+  JOIN "KnowledgeAsset" ka ON ka."id" = e."assetId"
+  JOIN "Repository" r ON r."id" = ka."repositoryId"`
+
+function buildAssetOrder(sort: AssetSortKey): string {
+  switch (sort) {
+    case "title":
+      return `ORDER BY ka."title" ASC`
+    case "updated":
+      return `ORDER BY ka."updatedAt" DESC`
+    case "relevance":
+    default:
+      return `ORDER BY 1 - (e."vector" <=> $1::vector) DESC`
+  }
+}
+
+function buildAssetSearchQuery(
+  vectorStr: string,
+  userId: string,
+  page: number,
+  pageSize: number,
+  sort: AssetSortKey,
+  filters: AssetSearchFilters | undefined,
+  threshold = 0.3
+): AssetQueryBuild {
+  const params: unknown[] = [vectorStr, userId]
+  const filterSql = buildAssetFilterConditions(filters, params)
+  const thresholdIndex = params.length + 1
+  params.push(threshold)
+  const countParams = [...params]
+
+  const whereSql = `
+    WHERE ka."userId" = $2
+      AND 1 - (e."vector" <=> $1::vector) > $${thresholdIndex}
+      ${filterSql}`
+
+  const offset = (page - 1) * pageSize
+  const limitParam = params.length + 1
+  const offsetClause = offset > 0 ? ` OFFSET $${limitParam + 1}` : ""
+  const rowsSql =
+    `SELECT ${ASSET_SELECT}` +
+    ASSET_FROM +
+    whereSql + `
+    ${buildAssetOrder(sort)}
+    LIMIT $${limitParam}${offsetClause}`
+  params.push(pageSize)
+  if (offset > 0) params.push(offset)
+
+  const countSql = `SELECT COUNT(*)::int AS "total"` + ASSET_FROM + whereSql
+
+  return { rowsSql, rowsParams: params, countSql, countParams }
+}
 
 export async function searchSimilarAssets(
   embedding: number[],
@@ -92,39 +211,19 @@ export async function searchSimilarAssets(
   filters?: AssetSearchFilters,
   threshold = 0.3
 ): Promise<AssetSearchResult[]> {
+  const normalizedLimit = normalizeLimit(limit)
+  const normalizedThreshold = normalizeThreshold(threshold)
   const vectorStr = `[${embedding.join(",")}]`
-  const params: unknown[] = [vectorStr, userId]
-
-  const filterSql = buildAssetFilterConditions(filters, params)
-
-  params.push(threshold, limit)
-
-  const results = await prisma.$queryRawUnsafe<AssetSearchResult[]>(
-    `SELECT
-       ka."id" AS "assetId",
-       ka."title",
-       ka."description",
-       ka."assetType",
-       ka."language",
-       ka."tags",
-       ka."difficulty",
-       ka."summary",
-       ka."sourcePath",
-       ka."repositoryId",
-       r."fullName" AS "repoFullName",
-       1 - (e."vector" <=> $1::vector) AS "similarity"
-     FROM "Embedding" e
-     JOIN "KnowledgeAsset" ka ON ka."id" = e."assetId"
-     JOIN "Repository" r ON r."id" = ka."repositoryId"
-     WHERE ka."userId" = $2
-       AND 1 - (e."vector" <=> $1::vector) > $${params.length - 1}
-       ${filterSql}
-     ORDER BY e."vector" <=> $1::vector
-     LIMIT $${params.length}`,
-    ...params
+  const build = buildAssetSearchQuery(
+    vectorStr,
+    userId,
+    1,
+    normalizedLimit,
+    "relevance",
+    filters,
+    normalizedThreshold,
   )
-
-  return results
+  return prisma.$queryRawUnsafe<AssetSearchResult[]>(build.rowsSql, ...build.rowsParams)
 }
 
 export async function searchByText(
@@ -136,6 +235,35 @@ export async function searchByText(
 ): Promise<AssetSearchResult[]> {
   const embedding = await generateEmbedding(query)
   return searchSimilarAssets(embedding, userId, limit, filters, threshold)
+}
+
+// ── Paginated, sortable asset search ─────────────────────────────
+
+export async function searchAssetsPage(
+  query: string,
+  userId: string,
+  options: AssetSearchOptions = {}
+): Promise<AssetSearchPageResult> {
+  const normalizedQuery = query.trim()
+  const page = normalizePage(options.page)
+  const pageSize = normalizePageSize(options.pageSize)
+  const sort: AssetSortKey = options.sort ?? "relevance"
+  const threshold = normalizeThreshold(options.threshold)
+
+  const empty: AssetSearchPageResult = { items: [], total: 0, page, pageSize, hasMore: false }
+  if (!normalizedQuery || !userId.trim()) return empty
+
+  const embedding = await generateEmbedding(normalizedQuery)
+  const vectorStr = `[${embedding.join(",")}]`
+  const build = buildAssetSearchQuery(vectorStr, userId, page, pageSize, sort, options.filters, threshold)
+
+  const [items, totalRows] = await Promise.all([
+    prisma.$queryRawUnsafe<AssetSearchResult[]>(build.rowsSql, ...build.rowsParams),
+    prisma.$queryRawUnsafe<{ total: number }[]>(build.countSql, ...build.countParams),
+  ])
+
+  const total = totalRows?.[0]?.total ?? 0
+  return { items, total, page, pageSize, hasMore: page * pageSize < total }
 }
 
 // ── Similar assets ───────────────────────────────────────────────

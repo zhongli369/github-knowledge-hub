@@ -2,13 +2,16 @@
 
 import { useEffect, useState } from "react"
 import Link from "next/link"
-import { Star, ExternalLink } from "lucide-react"
+import { Star, ExternalLink, AlertTriangle } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
+import { useLanguage } from "@/i18n/LanguageProvider"
 import { getSimilarReposAction } from "@/actions/discover"
 import type { SearchResult } from "@/services/llm/repo-embedding.service"
 
 export function SimilarRepos({ repoId }: { repoId: string }) {
+  const { t } = useLanguage()
   const [results, setResults] = useState<SearchResult[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
@@ -17,8 +20,11 @@ export function SimilarRepos({ repoId }: { repoId: string }) {
       .then((data) => {
         if (!cancelled) setResults(data)
       })
-      .catch(() => {
-        if (!cancelled) setResults([])
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          setResults([])
+          setError(err instanceof Error ? err.message : "Failed to load similar repos")
+        }
       })
       .finally(() => {
         if (!cancelled) setLoading(false)
@@ -39,7 +45,20 @@ export function SimilarRepos({ repoId }: { repoId: string }) {
     )
   }
 
-  if (!results || results.length === 0) return null
+  if (error) {
+    return (
+      <div className="flex items-center gap-1.5 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+        <AlertTriangle className="size-3.5 shrink-0" />
+        {t.library.similarReposError}
+      </div>
+    )
+  }
+
+  if (!results || results.length === 0) {
+    return (
+      <p className="text-xs text-muted-foreground">{t.library.noSimilarRepos}</p>
+    )
+  }
 
   return (
     <div className="grid gap-2">

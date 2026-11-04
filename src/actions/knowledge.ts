@@ -2,11 +2,15 @@
 
 import { auth } from "@/auth"
 import { prisma } from "@/lib/prisma"
+import { isEmbeddingUnavailableError } from "@/lib/embeddings"
 import { enqueueAssetExtraction, type EnqueueResult } from "@/services/intake"
 import {
   searchByText,
+  searchAssetsPage,
   getSimilarAssets as getSimilarAssetsSvc,
   type AssetSearchFilters,
+  type AssetSearchOptions,
+  type AssetSearchPageResult,
 } from "@/services/llm/embeddings.service"
 
 export async function extractAssetsAction(
@@ -49,6 +53,33 @@ export async function searchAssetsAction(
   const session = await auth()
   if (!session?.user?.id) throw new Error("Not authenticated")
   return searchByText(query, session.user.id, limit ?? 20, filters)
+}
+
+export interface AssetSearchActionResult {
+  ok: boolean
+  data: AssetSearchPageResult | null
+  error: string | null
+  errorCode: "NOT_AUTHENTICATED" | "EMBEDDING_UNAVAILABLE" | "SEARCH_FAILED" | null
+}
+
+export async function searchAssetsPageAction(
+  query: string,
+  options: AssetSearchOptions = {}
+): Promise<AssetSearchActionResult> {
+  const session = await auth()
+  if (!session?.user?.id) {
+    return { ok: false, data: null, error: "Not authenticated", errorCode: "NOT_AUTHENTICATED" }
+  }
+
+  try {
+    const data = await searchAssetsPage(query, session.user.id, options)
+    return { ok: true, data, error: null, errorCode: null }
+  } catch (error) {
+    const errorCode = isEmbeddingUnavailableError(error)
+      ? "EMBEDDING_UNAVAILABLE"
+      : "SEARCH_FAILED"
+    return { ok: false, data: null, error: "Search failed", errorCode }
+  }
 }
 
 export async function getSimilarAssetsAction(assetId: string) {
