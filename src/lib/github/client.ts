@@ -15,7 +15,15 @@ export async function createOctokit(userId: string): Promise<Octokit> {
     throw new Error("No GitHub token found for user")
   }
 
-  const token = await decryptToken(account.access_token)
+  let token: string
+  try {
+    token = decryptToken(account.access_token)
+  } catch (error) {
+    throw new Error(
+      `Failed to decrypt the stored GitHub token for user ${userId}. Reconnect the GitHub account and retry.`,
+      { cause: error },
+    )
+  }
 
   return new OctokitWithPlugins({
     auth: token,

@@ -1,10 +1,10 @@
 import NextAuth from "next-auth"
 import GitHub from "next-auth/providers/github"
-import { PrismaAdapter } from "@auth/prisma-adapter"
-import { prisma } from "@/lib/prisma"
+import { encryptedPrismaAdapter } from "@/lib/auth-adapter"
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
-  adapter: PrismaAdapter(prisma),
+  // Tokens written through the adapter are AES-256-GCM encrypted at rest.
+  adapter: encryptedPrismaAdapter(),
   trustHost: true,
   providers: [
     GitHub({
