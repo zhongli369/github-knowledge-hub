@@ -78,17 +78,15 @@ async function seedLegacyDatabase(database) {
         updatedAt: now,
       },
     })
-    await prisma.analysis.create({
-      data: {
-        id: "legacy-analysis",
-        analysisType: "repo_summary",
-        status: "completed",
-        repositoryId: "legacy-repo",
-        userId: "legacy-user",
-        createdAt: now,
-        updatedAt: now,
-      },
-    })
+    // The current generated Client includes P1 columns in Analysis writes.
+    // Seed the pre-P1 schema with explicit legacy columns instead.
+    await prisma.$executeRaw`
+      INSERT INTO "Analysis"
+        ("id", "analysisType", "status", "repositoryId", "userId", "createdAt", "updatedAt")
+      VALUES
+        ('legacy-analysis', 'repo_summary', 'completed', 'legacy-repo', 'legacy-user', ${now}, ${now}),
+        ('legacy-running-analysis', 'asset_extraction', 'running', 'legacy-repo', 'legacy-user', ${now}, ${now})
+    `
   } finally {
     await prisma.$disconnect()
   }
@@ -110,7 +108,17 @@ try {
       '  searchVector    Unsupported("tsvector")?',
     )
     .replace(/^  @@index\(\[searchVector\], type: Gin\)\r?\n/m, "")
-  if (legacySchema === currentSchema || legacySchema.includes("@@index([searchVector]")) {
+    .replace(
+      /^  \/\/ ── Worker leasing \(P1 Agent B\)[\s\S]*?^  attempts\s+Int\s+@default\(0\)\r?\n/m,
+      "",
+    )
+    .replace(/^  @@index\(\[status, leaseExpiresAt\]\)\r?\n/m, "")
+  if (
+    legacySchema === currentSchema ||
+    legacySchema.includes("@@index([searchVector]") ||
+    legacySchema.includes("leaseExpiresAt") ||
+    legacySchema.includes("@@index([status, leaseExpiresAt]")
+  ) {
     throw new Error("Could not derive the legacy Prisma schema fixture")
   }
   writeFileSync(legacySchemaPath, legacySchema, "utf8")

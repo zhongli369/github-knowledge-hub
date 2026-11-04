@@ -51,7 +51,7 @@ describe("Prisma migrations in isolated databases", () => {
     expect(await businessSchema(legacy)).toEqual(await businessSchema(fresh))
   })
 
-  it("records both migrations and creates generated searchVector plus GIN", async () => {
+  it("records all migrations and creates generated searchVector plus GIN", async () => {
     for (const prisma of [fresh, legacy]) {
       const migrations = await prisma.$queryRawUnsafe<Array<{ migration_name: string }>>(`
         SELECT migration_name FROM "_prisma_migrations"
@@ -61,6 +61,7 @@ describe("Prisma migrations in isolated databases", () => {
       expect(migrations.map((row) => row.migration_name)).toEqual([
         "20261103230000_init",
         "20261103231000_repository_search_vector",
+        "20261104101530_analysis_worker_leasing",
       ])
 
       const generated = await prisma.$queryRawUnsafe<Array<{ attgenerated: string; expression: string }>>(`
@@ -96,13 +97,23 @@ describe("Prisma migrations in isolated databases", () => {
       userId: "legacy-user",
     })
     expect(await legacy.user.count()).toBe(1)
-    expect(await legacy.analysis.count()).toBe(1)
+    expect(await legacy.analysis.count()).toBe(2)
 
     const matches = await legacy.$queryRawUnsafe<Array<{ id: string }>>(`
       SELECT id FROM "Repository"
       WHERE "searchVector" @@ websearch_to_tsquery('english', 'PostgreSQL')
     `)
     expect(matches).toEqual([{ id: "legacy-repo" }])
+  })
+
+  it("makes pre-existing running analyses recoverable by the new worker", async () => {
+    const analysis = await legacy.analysis.findUniqueOrThrow({
+      where: { id: "legacy-running-analysis" },
+    })
+    expect(analysis.status).toBe("running")
+    expect(analysis.attempts).toBe(0)
+    expect(analysis.claimedAt).toEqual(analysis.updatedAt)
+    expect(analysis.leaseExpiresAt).toEqual(analysis.updatedAt)
   })
 
   it("keeps both vector columns at 1536 dimensions", async () => {

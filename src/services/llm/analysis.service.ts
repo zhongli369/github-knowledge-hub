@@ -1,6 +1,7 @@
 import { openai } from "@/lib/openai"
 import { prisma } from "@/lib/prisma"
 import { generateRepoEmbedding } from "@/services/llm/repo-embedding.service"
+import { completeAnalysis } from "@/services/analysis/leasing.service"
 
 const PROMPT_VERSION = "repo-summary-v1"
 
@@ -38,28 +39,39 @@ export async function analyzeRepoSummary(
     defaultBranch: string
   },
   readme: string | null,
-  opts?: { analysisId?: string }
+  opts?: { analysisId?: string; workerId?: string }
 ): Promise<{ summary: RepoSummary; cached: boolean }> {
-  // ── Worker path: use existing record ──────────────────────────
+  // ── Worker path: use existing claimed record ──────────────────
   if (opts?.analysisId) {
-    // Update the claimed record to "running"
-    await prisma.analysis.update({
-      where: { id: opts.analysisId },
-      data: { status: "running", model: getModel() },
+    // The worker path must always carry the owning worker identity so the
+    // terminal update stays conditional on a valid lease; a stale worker can
+    // never overwrite a newer worker's result. Only the leasing worker calls
+    // this path with a workerId.
+    if (!opts.workerId) {
+      throw new AnalysisError("UNKNOWN", "Worker analysis requires a worker identity")
+    }
+
+    let summary: RepoSummary
+    try {
+      summary = await executeRepoSummaryCall(repoMeta, readme)
+    } catch (error) {
+      throw normalizeAnalysisError(error)
+    }
+
+    const completed = await completeAnalysis({
+      analysisId: opts.analysisId,
+      workerId: opts.workerId,
+      status: "completed",
+      result: JSON.parse(JSON.stringify({ summary, rawContent: summary.oneLine })),
+      model: getModel(),
     })
 
-    const summary = await executeRepoSummaryCall(repoMeta, readme)
-
-    await prisma.analysis.update({
-      where: { id: opts.analysisId },
-      data: {
-        status: "completed",
-        result: JSON.parse(JSON.stringify({ summary, rawContent: summary.oneLine })),
-      },
-    })
-
-    // Best-effort embedding generation
-    tryEmbedding(repoId, userId)
+    if (completed) {
+      // Best-effort embedding generation, only while we still own the task.
+      tryEmbedding(repoId, userId)
+    } else {
+      console.warn(`[worker] Lost lease for ${opts.analysisId}; repo summary result discarded`)
+    }
 
     return { summary, cached: false }
   }
@@ -123,33 +135,32 @@ export async function analyzeRepoSummary(
 
     return { summary, cached: false }
   } catch (error) {
-    if (error instanceof AnalysisError) {
-      await prisma.analysis.update({
-        where: { id: analysis.id },
-        data: { status: "failed", error: error.message.slice(0, 1000) },
-      })
-      throw error
-    }
-
-    const errMsg = error instanceof Error ? error.message : "Unknown error"
-    let code: AnalysisErrorCode = "LLM_CALL_FAILED"
-    let userMsg = "LLM call failed. Please try again."
-
-    if (error instanceof SyntaxError) {
-      code = "LLM_JSON_PARSE_FAILED"
-      userMsg = "LLM returned invalid JSON and could not be parsed."
-    } else if (errMsg.includes("API key") || errMsg.includes("apiKey") || errMsg.includes("Incorrect API key")) {
-      code = "API_KEY_MISSING"
-      userMsg = "API key is invalid or missing. Check OPENAI_API_KEY in .env."
-    }
-
+    const analysisError = normalizeAnalysisError(error)
     await prisma.analysis.update({
       where: { id: analysis.id },
-      data: { status: "failed", error: userMsg.slice(0, 1000) },
+      data: { status: "failed", error: analysisError.message.slice(0, 1000) },
     })
-
-    throw new AnalysisError(code, userMsg)
+    throw analysisError
   }
+}
+
+function normalizeAnalysisError(error: unknown): AnalysisError {
+  if (error instanceof AnalysisError) return error
+
+  const errMsg = error instanceof Error ? error.message : "Unknown error"
+  if (error instanceof SyntaxError) {
+    return new AnalysisError(
+      "LLM_JSON_PARSE_FAILED",
+      "LLM returned invalid JSON and could not be parsed.",
+    )
+  }
+  if (errMsg.includes("API key") || errMsg.includes("apiKey") || errMsg.includes("Incorrect API key")) {
+    return new AnalysisError(
+      "API_KEY_MISSING",
+      "API key is invalid or missing. Check OPENAI_API_KEY in .env.",
+    )
+  }
+  return new AnalysisError("LLM_CALL_FAILED", "LLM call failed. Please try again.")
 }
 
 // ── Best-effort embedding helper ────────────────────────────────

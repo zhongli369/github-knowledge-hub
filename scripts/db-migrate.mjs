@@ -8,6 +8,7 @@ const { PrismaClient } = prismaPackage
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 const initialMigration = "20261103230000_init"
 const searchMigration = "20261103231000_repository_search_vector"
+const workerLeasingMigration = "20261104101530_analysis_worker_leasing"
 const prismaCli = path.join(root, "node_modules", "prisma", "build", "index.js")
 
 if (!process.env.DATABASE_URL && existsSync(path.join(root, ".env"))) {
@@ -60,16 +61,38 @@ async function verifyMigratedSchema(prisma) {
     throw new Error("Repository_searchVector_idx is missing or is not a GIN index")
   }
 
+  const leasingColumns = await prisma.$queryRawUnsafe(`
+    SELECT column_name FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'Analysis'
+      AND column_name IN ('workerId', 'claimedAt', 'leaseExpiresAt', 'attempts')
+  `)
+  const expectedLeasingColumns = ["workerId", "claimedAt", "leaseExpiresAt", "attempts"]
+  if (
+    leasingColumns.length !== expectedLeasingColumns.length ||
+    expectedLeasingColumns.some((name) => !leasingColumns.some((column) => column.column_name === name))
+  ) {
+    throw new Error("Analysis worker leasing columns are missing")
+  }
+
+  const leasingIndexes = await prisma.$queryRawUnsafe(`
+    SELECT indexname FROM pg_indexes
+    WHERE schemaname = 'public' AND tablename = 'Analysis'
+      AND indexname = 'Analysis_status_leaseExpiresAt_idx'
+  `)
+  if (leasingIndexes.length !== 1) {
+    throw new Error("Analysis_status_leaseExpiresAt_idx is missing")
+  }
+
   const migrations = await prisma.$queryRawUnsafe(`
     SELECT migration_name, finished_at, rolled_back_at
     FROM "_prisma_migrations"
-    WHERE migration_name IN ($1, $2)
-  `, initialMigration, searchMigration)
+    WHERE migration_name IN ($1, $2, $3)
+  `, initialMigration, searchMigration, workerLeasingMigration)
   if (
-    migrations.length !== 2 ||
+    migrations.length !== 3 ||
     migrations.some((migration) => !migration.finished_at || migration.rolled_back_at)
   ) {
-    throw new Error("Prisma migration history does not contain both successful migrations")
+    throw new Error("Prisma migration history does not contain all three successful migrations")
   }
 }
 
@@ -106,6 +129,15 @@ async function assertBaselineEligible(prisma) {
     "--script",
   ], true).replaceAll("\r\n", "\n").trim()
   const expectedLegacyDiff = [
+    "-- AlterTable",
+    'ALTER TABLE "Analysis" ADD COLUMN     "attempts" INTEGER NOT NULL DEFAULT 0,',
+    'ADD COLUMN     "claimedAt" TIMESTAMP(3),',
+    'ADD COLUMN     "leaseExpiresAt" TIMESTAMP(3),',
+    'ADD COLUMN     "workerId" TEXT;',
+    "",
+    "-- CreateIndex",
+    'CREATE INDEX "Analysis_status_leaseExpiresAt_idx" ON "Analysis"("status", "leaseExpiresAt");',
+    "",
     "-- CreateIndex",
     'CREATE INDEX "Repository_searchVector_idx" ON "Repository" USING GIN ("searchVector");',
   ].join("\n")
@@ -141,7 +173,7 @@ try {
 
   if (command === "deploy" || execute) {
     await verifyMigratedSchema(prisma)
-    console.log("Verified generated searchVector, GIN index, and successful migration history.")
+    console.log("Verified generated searchVector, GIN index, worker leasing fields, and successful migration history.")
   }
 } finally {
   await prisma.$disconnect()

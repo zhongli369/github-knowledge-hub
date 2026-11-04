@@ -195,7 +195,18 @@ model Analysis {
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt
 
+  // ── Worker leasing (P1 Agent B) ────────────────────────────────
+  // Identity of the worker that currently owns the task lease.
+  workerId        String?
+  // When the current lease was acquired by the owning worker.
+  claimedAt       DateTime?
+  // Lease expiry. A "running" task with a past lease is reclaimable.
+  leaseExpiresAt  DateTime?
+  // Number of times the task has been claimed; bounded by worker MAX_ATTEMPTS.
+  attempts        Int            @default(0)
+
   @@index([userId])
   @@index([status])
   @@index([analysisType])
+  @@index([status, leaseExpiresAt])
 }
