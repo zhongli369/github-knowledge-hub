@@ -24,6 +24,7 @@ import { prisma } from "@/lib/prisma"
 import { enqueueAssetExtraction, REPOSITORY_NOT_FOUND_ERROR } from "@/services/intake"
 import { extractFromFile, extractWithLLM, extractAssetsFromRepo } from "@/services/knowledge/extraction.service"
 import { analyzeRepoSummary } from "@/services/llm/analysis.service"
+import { syncRepoToDb, type GitHubRepo } from "@/services/github/repos.service"
 
 const SUMMARY_JSON = JSON.stringify({
   oneLine: "A sample repo",
@@ -138,6 +139,53 @@ describe("intake queue behaviour against the real database", () => {
       },
     })
     expect(active).toHaveLength(1)
+  })
+})
+
+describe("per-user repository identity against the real database", () => {
+  it("syncs the same GitHub repository into independent rows for two users", async () => {
+    const userIds = ["p1x-sync-a", "p1x-sync-b"] as const
+    const now = new Date()
+    await prisma.user.createMany({
+      data: userIds.map((id) => ({ id, name: `Sync ${id}`, updatedAt: now })),
+    })
+
+    const githubRepo: GitHubRepo = {
+      id: 848401,
+      owner: "shared-owner",
+      name: "shared-repo",
+      fullName: "shared-owner/shared-repo",
+      description: "Synced independently by two users",
+      url: "https://example.invalid/shared-owner/shared-repo",
+      homepage: null,
+      language: "TypeScript",
+      stars: 7,
+      forks: 1,
+      topics: ["isolation"],
+      defaultBranch: "main",
+      isArchived: false,
+      isTemplate: false,
+      license: "MIT",
+      size: 20,
+      pushedAt: null,
+    }
+
+    await syncRepoToDb(userIds[0], githubRepo)
+    await syncRepoToDb(userIds[1], githubRepo)
+
+    const where = { githubId: githubRepo.id, userId: { in: [...userIds] } }
+    const initial = await prisma.repository.findMany({ where })
+    expect(initial).toHaveLength(2)
+    expect(new Set(initial.map((repo) => repo.id)).size).toBe(2)
+    expect(initial.map((repo) => repo.userId).sort()).toEqual([...userIds])
+    expect(initial.every((repo) => repo.fullName === githubRepo.fullName)).toBe(true)
+
+    // Re-syncing A updates only A's row; it neither steals nor duplicates B's.
+    await syncRepoToDb(userIds[0], { ...githubRepo, stars: 99 })
+    const after = await prisma.repository.findMany({ where })
+    expect(after).toHaveLength(2)
+    expect(after.find((repo) => repo.userId === userIds[0])?.stars).toBe(99)
+    expect(after.find((repo) => repo.userId === userIds[1])?.stars).toBe(7)
   })
 })
 
