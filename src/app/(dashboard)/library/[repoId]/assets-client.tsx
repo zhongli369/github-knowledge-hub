@@ -205,7 +205,7 @@ export function AssetsClient({ repoId }: { repoId: string }) {
                 )}
                 {a.difficulty && (
                   <Badge variant="outline" className="text-[10px]">
-                    {a.difficulty}
+                    {t.assets[a.difficulty as keyof typeof t.assets] ?? a.difficulty}
                   </Badge>
                 )}
                 {a.tags.slice(0, 4).map((tag) => (

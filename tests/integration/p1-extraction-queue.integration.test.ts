@@ -22,7 +22,7 @@ vi.mock("@/services/github", () => ({
 
 import { prisma } from "@/lib/prisma"
 import { enqueueAssetExtraction } from "@/services/intake"
-import { extractAssetsFromRepo } from "@/services/knowledge/extraction.service"
+import { extractFromFile, extractWithLLM, extractAssetsFromRepo } from "@/services/knowledge/extraction.service"
 import { analyzeRepoSummary } from "@/services/llm/analysis.service"
 
 const SUMMARY_JSON = JSON.stringify({
@@ -145,6 +145,50 @@ describe("knowledge asset extraction pipeline against the real database", () => 
       useLLM: false,
     })
     expect(rerun).toEqual({ extracted: 0, skipped: 2, embedded: 0 })
+  })
+
+  it("persists a validated difficulty parsed from the LLM result and keeps null for unparseable payloads", async () => {
+    const patternJson = JSON.stringify({
+      patternName: "DispatchPipeline",
+      whatItDoes: "Event-driven middleware dispatch",
+      reuseValue: "Reuse the pipeline",
+      keyInsight: "Decouple handlers",
+      difficulty: "advanced",
+    })
+    mocks.openaiCreate.mockResolvedValue({ choices: [{ message: { content: patternJson } }] })
+
+    const rich =
+      "// event-driven middleware pipeline with a retry queue and dead-letter architecture\n" +
+      "// reliable job delivery across workers with graceful fallbacks and caching\n"
+    const content = rich.repeat(3).padEnd(120, "x")
+
+    const result = await extractWithLLM("p1x-user", "p1x-repo-1", "src/dispatch-llm.ts", content, "TypeScript")
+    expect(result).not.toBeNull()
+
+    const asset = await prisma.knowledgeAsset.findUniqueOrThrow({ where: { id: result!.assetId } })
+    expect(asset.difficulty).toBe("advanced")
+    expect(asset.summary).toBe(patternJson)
+
+    // Invalid difficulty must be stored as null, never fabricated.
+    mocks.openaiCreate.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify({ patternName: "X", whatItDoes: "y", difficulty: "expert" }) } }],
+    })
+    const fallback = await extractWithLLM("p1x-user", "p1x-repo-1", "src/dispatch-bad.ts", content, "TypeScript")
+    const badAsset = await prisma.knowledgeAsset.findUniqueOrThrow({ where: { id: fallback!.assetId } })
+    expect(badAsset.difficulty).toBeNull()
+  })
+
+  it("refuses to extract assets into a repository the caller does not own", async () => {
+    await expect(
+      extractAssetsFromRepo("someone-else", "p1x-repo-2", "alice", "p1-summary", { maxFiles: 1, useLLM: false }),
+    ).rejects.toThrow("Repository not found or not owned by this user")
+  })
+
+  it("keeps extractFromFile assets explicit with a null difficulty", async () => {
+    const result = await extractFromFile("p1x-user", "p1x-repo-1", "src/plain-helper.ts", "const a = 1\n".repeat(20), "TypeScript")
+    expect(result).not.toBeNull()
+    const asset = await prisma.knowledgeAsset.findUniqueOrThrow({ where: { id: result!.assetId } })
+    expect(asset.difficulty).toBeNull()
   })
 })
 

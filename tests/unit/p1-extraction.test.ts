@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 const mocks = vi.hoisted(() => ({
   create: vi.fn(),
   findMany: vi.fn(),
+  repoFindFirst: vi.fn(),
   analyzeCodePatterns: vi.fn(),
   embedKnowledgeAsset: vi.fn(),
   fetchRepoFileTree: vi.fn(),
@@ -14,6 +15,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock("@/lib/prisma", () => ({
   prisma: {
     knowledgeAsset: { create: mocks.create, findMany: mocks.findMany },
+    repository: { findFirst: mocks.repoFindFirst },
   },
 }))
 vi.mock("@/services/llm/analysis.service", () => ({ analyzeCodePatterns: mocks.analyzeCodePatterns }))
@@ -23,7 +25,13 @@ vi.mock("@/services/github", () => ({
   fetchFileContent: mocks.fetchFileContent,
 }))
 
-import { extractFromFile, extractWithLLM, extractAssetsFromRepo } from "@/services/knowledge/extraction.service"
+import {
+  extractFromFile,
+  extractWithLLM,
+  extractAssetsFromRepo,
+  parseCodeAnalysisResult,
+  normalizeDifficulty,
+} from "@/services/knowledge/extraction.service"
 
 const SORTING_CONTENT =
   "function quickSort(list) {\n  if (list.length <= 1) return list;\n  const pivot = list[0];\n  const rest = list.slice(1);\n  return [...quickSort(rest.filter((x) => x < pivot)), pivot, ...quickSort(rest.filter((x) => x >= pivot))];\n}"
@@ -36,10 +44,72 @@ const SORTING_LANG_JSON = JSON.stringify({
   difficulty: "intermediate",
 })
 
+// Rich enough (>50 chars) and pattern-adjacent (middleware/pipeline/queue) so
+// extractWithLLM's interest filter lets it through.
+const INTERESTING_CONTENT =
+  "// An event-driven middleware pipeline with a retry queue and dead-letter fallback.\n" +
+  "// Dispatch arbitrary configuration events with graceful degradation.\n" +
+  "export function dispatch(evt) {\n  pipeline.run(evt);\n  retries.enqueue(evt);\n}\n" +
+  "padding-to-ensure-content-clearly-exceeds-fifty-characters"
+
 beforeEach(() => {
   vi.clearAllMocks()
   mocks.embedKnowledgeAsset.mockResolvedValue(undefined)
   mocks.analyzeCodePatterns.mockResolvedValue(SORTING_LANG_JSON)
+  mocks.repoFindFirst.mockResolvedValue({ id: "repo-1" })
+})
+
+describe("normalizeDifficulty", () => {
+  it("accepts only the three allowed values", () => {
+    expect(normalizeDifficulty("beginner")).toBe("beginner")
+    expect(normalizeDifficulty("intermediate")).toBe("intermediate")
+    expect(normalizeDifficulty("advanced")).toBe("advanced")
+  })
+
+  it("rejects unknown, empty and non-string values with null", () => {
+    expect(normalizeDifficulty("expert")).toBeNull()
+    expect(normalizeDifficulty("")).toBeNull()
+    expect(normalizeDifficulty("  beginner  ")).toBeNull()
+    expect(normalizeDifficulty(1)).toBeNull()
+    expect(normalizeDifficulty(null)).toBeNull()
+    expect(normalizeDifficulty(undefined)).toBeNull()
+  })
+})
+
+describe("parseCodeAnalysisResult", () => {
+  it("strips markdown fences and extracts a valid difficulty", () => {
+    const raw = "```json\n" + SORTING_LANG_JSON + "\n```"
+    const parsed = parseCodeAnalysisResult(raw)
+    expect(parsed.difficulty).toBe("intermediate")
+    expect(parsed.summary).toBe(SORTING_LANG_JSON)
+  })
+
+  it("maps an invalid difficulty to null while keeping the summary", () => {
+    const raw = JSON.stringify({ patternName: "Q", whatItDoes: "x", difficulty: "expert" })
+    expect(parseCodeAnalysisResult(raw)).toEqual({ summary: raw, difficulty: null })
+  })
+
+  it("returns all-null when the payload is not valid JSON", () => {
+    expect(parseCodeAnalysisResult("certainly not json")).toEqual({
+      summary: null,
+      difficulty: null,
+    })
+  })
+
+  it("returns all-null for a non-object payload", () => {
+    expect(parseCodeAnalysisResult("[1,2,3]")).toEqual({ summary: null, difficulty: null })
+  })
+
+  it("treats the LLM-failure fallback difficulty (empty) as null", () => {
+    const fallback = JSON.stringify({
+      patternName: "a.ts",
+      whatItDoes: "LLM parse failed — retry or check manually",
+      reuseValue: "",
+      keyInsight: "",
+      difficulty: "",
+    })
+    expect(parseCodeAnalysisResult(fallback)).toEqual({ summary: fallback, difficulty: null })
+  })
 })
 
 describe("extractFromFile", () => {
@@ -68,6 +138,7 @@ describe("extractFromFile", () => {
         content: expect.stringContaining("quickSort"),
         language: "TypeScript",
         tags: ["algorithm"],
+        difficulty: null,
         repositoryId: "repo-1",
         userId: "user-1",
       }),
@@ -137,6 +208,60 @@ describe("extractWithLLM", () => {
       expect.stringContaining("dispatch.ts"),
     )
   })
+
+  it("persists a validated difficulty parsed from the LLM JSON", async () => {
+    mocks.create.mockResolvedValue({ id: "asset-3", title: "q.ts", assetType: "algorithm" })
+
+    await extractWithLLM("user-1", "repo-1", "src/q.ts", INTERESTING_CONTENT, "TypeScript")
+
+    expect(mocks.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        summary: SORTING_LANG_JSON,
+        difficulty: "intermediate",
+      }),
+    })
+    // Embedding content includes the sanitized summary so search can index it.
+    expect(mocks.embedKnowledgeAsset).toHaveBeenCalledWith(
+      "asset-3",
+      expect.stringContaining("intermediate"),
+    )
+  })
+
+  it("keeps difficulty null for an unknown LLM difficulty instead of fabricating one", async () => {
+    mocks.analyzeCodePatterns.mockResolvedValue(
+      JSON.stringify({ patternName: "Q", whatItDoes: "x", difficulty: "expert" }),
+    )
+    mocks.create.mockResolvedValue({ id: "asset-4", title: "q.ts", assetType: "algorithm" })
+
+    await extractWithLLM("user-1", "repo-1", "src/q.ts", INTERESTING_CONTENT, "TypeScript")
+
+    expect(mocks.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        difficulty: null,
+      }),
+    })
+  })
+
+  it("keeps summary and difficulty null when the LLM payload is not JSON", async () => {
+    mocks.analyzeCodePatterns.mockResolvedValue("not json at all")
+    mocks.create.mockResolvedValue({ id: "asset-5", title: "q.ts", assetType: "algorithm" })
+
+    await extractWithLLM("user-1", "repo-1", "src/q.ts", INTERESTING_CONTENT, "TypeScript")
+
+    expect(mocks.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        summary: null,
+        difficulty: null,
+      }),
+    })
+  })
+
+  it("deduplicates via the unique constraint and skips embedding on P2002", async () => {
+    mocks.create.mockRejectedValue({ code: "P2002" })
+
+    expect(await extractWithLLM("user-1", "repo-1", "src/q.ts", INTERESTING_CONTENT, "TypeScript")).toBeNull()
+    expect(mocks.embedKnowledgeAsset).not.toHaveBeenCalled()
+  })
 })
 
 describe("extractAssetsFromRepo", () => {
@@ -144,6 +269,18 @@ describe("extractAssetsFromRepo", () => {
     { path: "src/helper.ts", type: "file" as const, size: 100 },
     { path: "README.md", type: "file" as const, size: 500 },
   ]
+
+  it("rejects extraction into a repository the user does not own", async () => {
+    mocks.repoFindFirst.mockResolvedValue(null)
+    mocks.fetchRepoFileTree.mockResolvedValue(tree)
+
+    await expect(
+      extractAssetsFromRepo("user-1", "repo-other", "owner", "repo", { maxFiles: 20, useLLM: false }),
+    ).rejects.toThrow("Repository not found or not owned by this user")
+
+    expect(mocks.fetchRepoFileTree).not.toHaveBeenCalled()
+    expect(mocks.create).not.toHaveBeenCalled()
+  })
 
   it("extracts known-extension files when useLLM=false and counts embedded assets", async () => {
     mocks.fetchRepoFileTree.mockResolvedValue(tree)

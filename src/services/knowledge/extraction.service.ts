@@ -1,11 +1,24 @@
-// TODO(Phase 5): Code → knowledge asset extraction with LLM — not yet wired into the main flow.
-// Enable after repo/library E2E is verified.
-
 import { prisma } from "@/lib/prisma"
 import { analyzeCodePatterns } from "@/services/llm/analysis.service"
 import { embedKnowledgeAsset } from "@/services/llm/embeddings.service"
 
 // File extension → language mapping will be re-added when Phase 5 is enabled.
+
+export const ASSET_DIFFICULTIES = ["beginner", "intermediate", "advanced"] as const
+export type AssetDifficulty = (typeof ASSET_DIFFICULTIES)[number]
+
+const DIFFICULTY_SET: ReadonlySet<string> = new Set<string>(ASSET_DIFFICULTIES)
+
+/**
+ * Normalize a raw difficulty value to one of the allowed asset values.
+ * Anything else (missing, empty, unknown, wrong language) maps to null so we
+ * never fabricate a difficulty for legacy or malformed data.
+ */
+export function normalizeDifficulty(value: unknown): AssetDifficulty | null {
+  return typeof value === "string" && DIFFICULTY_SET.has(value)
+    ? (value as AssetDifficulty)
+    : null
+}
 
 const INTERESTING_PATTERNS = [
   /algorithm/i,
@@ -35,6 +48,43 @@ export interface ExtractionResult {
   assetType: string
 }
 
+export interface ParsedCodeAnalysis {
+  /** Sanitized JSON summary, or null when the LLM payload is not valid JSON. */
+  summary: string | null
+  /** Validated difficulty, or null when the payload is missing/invalid. */
+  difficulty: AssetDifficulty | null
+}
+
+/**
+ * Validate and normalize the raw code-pattern analysis returned by
+ * `analyzeCodePatterns`. Markdown code fences are stripped first; unparseable
+ * payloads (or non-object shapes) yield entirely-null results so that garbage is
+ * never persisted and difficulty is never fabricated.
+ */
+export function parseCodeAnalysisResult(raw: string): ParsedCodeAnalysis {
+  const jsonStr = raw
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "")
+    .trim()
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(jsonStr)
+  } catch {
+    return { summary: null, difficulty: null }
+  }
+
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { summary: null, difficulty: null }
+  }
+
+  const record = parsed as Record<string, unknown>
+  return {
+    summary: jsonStr.slice(0, 2000),
+    difficulty: normalizeDifficulty(record.difficulty),
+  }
+}
+
 export async function extractFromFile(
   userId: string,
   repositoryId: string,
@@ -54,6 +104,7 @@ export async function extractFromFile(
         content: content.slice(0, 50000),
         language,
         tags: extractTags(path, content),
+        difficulty: null,
         repositoryId,
         userId,
       },
@@ -100,6 +151,7 @@ export async function extractWithLLM(
     fileName,
     language,
   })
+  const parsed = parseCodeAnalysisResult(analysis)
 
   try {
     const asset = await prisma.knowledgeAsset.create({
@@ -109,7 +161,8 @@ export async function extractWithLLM(
         assetType: detectAssetType(path, content),
         sourcePath: path,
         content: content.slice(0, 50000),
-        summary: analysis.slice(0, 2000),
+        summary: parsed.summary,
+        difficulty: parsed.difficulty,
         language,
         tags: extractTags(path, content),
         repositoryId,
@@ -118,7 +171,8 @@ export async function extractWithLLM(
     })
 
     try {
-      await embedKnowledgeAsset(asset.id, `${fileName}\n${analysis}`)
+      const embedText = parsed.summary ? `${fileName}\n${parsed.summary}` : fileName
+      await embedKnowledgeAsset(asset.id, embedText)
     } catch {
       // best-effort
     }
@@ -205,8 +259,13 @@ const EXT_TO_LANG: Record<string, string> = {
 
 /**
  * Extract knowledge assets from a repository.
- * Known limitation: does NOT check for existing assets — re-running on the same repo
- * will create duplicates. Deduplication is planned for Phase 7.1.
+ *
+ * Ownership is verified first: a user may only write assets into repositories
+ * they own, so a caller can never inject assets into another user's repo.
+ *
+ * Re-runs are idempotent: paths already extracted for this repository are
+ * skipped up-front, and the KnowledgeAsset(repositoryId, sourcePath) unique
+ * index catches concurrent double-inserts (P2002) as a safety net.
  */
 export async function extractAssetsFromRepo(
   userId: string,
@@ -216,6 +275,16 @@ export async function extractAssetsFromRepo(
   options?: { maxFiles?: number; useLLM?: boolean }
 ): Promise<{ extracted: number; skipped: number; embedded: number }> {
   const { fetchRepoFileTree, fetchFileContent } = await import("@/services/github")
+
+  // Permission boundary: refuse to write assets into a repo the caller does not own.
+  const ownedRepo = await prisma.repository.findFirst({
+    where: { id: repositoryId, userId },
+    select: { id: true },
+  })
+  if (!ownedRepo) {
+    throw new Error("Repository not found or not owned by this user")
+  }
+
   const maxFiles = options?.maxFiles ?? 20
   const useLLM = options?.useLLM ?? true
 

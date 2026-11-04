@@ -57,7 +57,7 @@ export default async function AssetDetailPage({ params }: Props) {
             {asset.assetType}
           </Badge>
           {asset.difficulty && (
-            <Badge variant="outline" className="text-xs">{asset.difficulty}</Badge>
+            <Badge variant="outline" className="text-xs">{t.assets[asset.difficulty as keyof typeof t.assets] ?? asset.difficulty}</Badge>
           )}
         </div>
 
