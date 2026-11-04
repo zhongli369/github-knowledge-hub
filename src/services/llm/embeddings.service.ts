@@ -170,6 +170,8 @@ export async function getSimilarAssets(
      JOIN "KnowledgeAsset" ka ON ka."id" = e."assetId"
      JOIN "Repository" r ON r."id" = ka."repositoryId"
      JOIN "Embedding" target ON target."assetId" = $1
+     JOIN "KnowledgeAsset" targetAsset
+       ON targetAsset."id" = target."assetId" AND targetAsset."userId" = $2
      WHERE ka."userId" = $2
        AND ka."id" != $1
        AND 1 - (e."vector" <=> target."vector") > 0.3

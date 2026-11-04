@@ -309,6 +309,8 @@ export async function getSimilarRepos(
      FROM "RepoEmbedding" re
      JOIN "Repository" r ON r."id" = re."repositoryId"
      JOIN "RepoEmbedding" target ON target."repositoryId" = $1
+     JOIN "Repository" targetRepo
+       ON targetRepo."id" = target."repositoryId" AND targetRepo."userId" = $2
      LEFT JOIN LATERAL (
        SELECT "result" FROM "Analysis"
        WHERE "repositoryId" = r."id"

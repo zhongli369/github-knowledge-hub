@@ -160,7 +160,7 @@ const SKIP_EXTENSIONS = new Set([
   ".gz", ".webp", ".svg", ".woff", ".woff2", ".ttf", ".eot", ".mp4",
   ".mp3", ".mov", ".avi", ".lock", ".sum", ".map",
 ])
-const SKIP_FILE_PATTERNS = [/\.min\.js$/, /\.bundle\.js$/, /\.chunk\.js$/]
+const SKIP_FILE_PATTERNS = [/\.min\.js$/, /\.bundle\.js$/, /\.chunk\.js$/, /\.map\.js$/]
 const MAX_FILE_SIZE = 500_000 // 500KB
 const MAX_TREE_ENTRIES = 200
 
@@ -185,8 +185,9 @@ export async function fetchRepoFileTree(
       if (!item.path || !item.type) continue
       if (entries.length >= MAX_TREE_ENTRIES) break
 
-      // Filter dirs
-      if (item.type === "tree" && SKIP_DIRS.some((d) => item.path!.startsWith(d))) continue
+      // Exclude files below ignored directories as well as the tree entries.
+      // GitHub's recursive response does not guarantee a parent tree row.
+      if (SKIP_DIRS.some((dir) => item.path!.startsWith(dir) || item.path!.includes(`/${dir}`))) continue
 
       // Filter files
       if (item.type === "blob") {
