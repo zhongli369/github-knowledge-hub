@@ -1,14 +1,26 @@
 # GitHub Knowledge Hub
 
+[![CI](https://github.com/zhongli369/github-knowledge-hub/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/zhongli369/github-knowledge-hub/actions/workflows/ci.yml?query=branch%3Amain)
+
 个人 GitHub 知识库：**同步仓库 → AI 摘要 → 代码资产提取 → 语义/全文混合搜索 → 收藏整理**。
 
 架构为 **Next.js 单体 Web + 独立分析 Worker + PostgreSQL/pgvector**。项目主要面向个人本地使用；数据库 migration、核心回归测试和桌面启动已建立，但仍不是开箱即用的生产部署方案。
+
+## 当前状态
+
+截至 **2026-11-04**：
+
+- `main` 已包含 Repository 多用户隔离、入队归属校验、Worker lease/fencing/超时恢复、GitHub 错误分类、Token v2 AAD 加密和隔离测试基础设施。
+- 本地集中验证通过：TypeScript、Prisma validate、ESLint、**13 个文件 / 212 项单元测试**、**8 个文件 / 59 项隔离集成测试**，以及 Next.js production build。
+- 真实 Docker 数据库已完成 baseline 和 **4 条 migration**；`prisma migrate status` 为 up to date，桌面 Web + Worker 启动及 `http://localhost:3000` 可用性已验证。
+- 真实存量 Account Token 仍未迁移；真实 OAuth、GitHub 同步、LLM 和 Embedding 外部服务仍需单独人工验收。
+- GitHub Actions 的最新状态以顶部 CI badge 和 Actions 页面为准；本地验证不替代远程 CI 结论。
 
 ## 文档导航
 
 - [项目维护指南](docs/PROJECT_MAINTENANCE_GUIDE.md)：功能、部署、migration、备份恢复、验证范围和故障排查。
 - [架构说明](docs/ARCHITECTURE.md)：系统图、数据流、实体关系、Web/Worker 职责边界。
-- [开发路线图](docs/DEVELOPMENT_ROADMAP.md)：P0/P1 完成状态与后续 P2 工作。
+- [开发路线图](docs/DEVELOPMENT_ROADMAP.md)：阶段状态与后续工作。
 
 > “源码已实现”不等于真实外部服务已验收。真实 OAuth、LLM 和 Embedding 的验证边界见维护指南。
 
@@ -17,16 +29,17 @@
 | 模块 | 状态 | 说明 |
 |---|---|---|
 | GitHub OAuth 登录 | 源码已接通 | Auth.js + 加密 Prisma Adapter；真实 OAuth 回调/重新授权未重验 |
-| OAuth Token 存储 | 新写入已加密 | AES-256-GCM；access/refresh 均加密，旧明文兼容；真实存量 Token 尚未迁移 |
-| 我的仓库 / Starred 同步 | 源码已接通 | Octokit + retry/throttling；真实同步未在本轮重验 |
-| Library 搜索、筛选、排序 | 源码已接通 | 笔记、状态、摘要和 Topic 管理 |
-| AI 仓库摘要、缓存、重试 | 源码已接通 | Server Action 同步执行，支持批量顺序生成 |
+| OAuth Token 存储 | 新写入已加密 | AES-256-GCM v2 AAD 绑定 Account/字段上下文；兼容 v1 与旧密钥轮换；真实存量 Token 尚未迁移 |
+| Repository 用户隔离 | 真实 migration 完成 | `(userId, githubId/fullName)` 唯一、入队 ownership gate、active Analysis 防重；双用户同步同一 GitHub 仓库已通过 PostgreSQL 测试 |
+| 我的仓库 / Starred 同步 | 源码已接通 | Octokit + retry/throttling；仅 404 表示资源缺失，truncated Tree 显式失败；真实同步未在本轮重验 |
+| Library 搜索、筛选、排序 | 源码已接通 | 笔记、状态、摘要和 Topic 管理，查询按当前用户隔离 |
+| AI 仓库摘要、缓存、重试 | 源码已接通 | Server Action 同步执行，支持批量顺序生成；direct path 有有限恢复租约和 stale-write 防护 |
 | 知识资产提取 | 隔离测试通过 | **必须运行 Worker**；外部 GitHub/LLM 在测试中 Mock |
-| Worker 可靠性 | 隔离 PostgreSQL 测试通过 | 原子领取、60 秒 lease、20 秒 heartbeat、最多 3 次 attempts、stale-write 防护 |
+| Worker 可靠性 | 隔离 PostgreSQL 测试通过 | 原子领取、NULL/过期 lease 回收、heartbeat、超时、有界重试、三任务并发池和 attempts fencing |
 | 资产向量搜索、相似推荐 | 源码已接通 | 依赖可用 Embedding 配置；真实 provider 未在本轮重验 |
-| Discover 三模式搜索 | 隔离测试通过 | keyword/hybrid/semantic、筛选、用户隔离；真实 semantic 仍需 provider |
-| Collections | 部分实现 | 创建、删除、添加/移除资产；无编辑和完整分享 |
-| Analyses | 部分实现 | 有历史与筛选；Token/耗时遥测未采集 |
+| Discover 三模式搜索 | 隔离测试通过 | keyword/hybrid/semantic、分页、筛选和用户隔离；真实 semantic 仍需 provider |
+| Collections | 源码已接通 | 创建、删除、重命名、描述编辑、批量添加/移除和排序；无完整分享 |
+| Analyses | 源码已接通 | 历史与筛选；摘要链路已采集 `tokensUsed` / `durationMs`，真实 provider 数据未重验 |
 | 依赖分析 | 未实现 | 当前函数明确抛出未实现异常 |
 
 ## 技术栈
@@ -95,7 +108,7 @@ npm run db:baseline       # 只读安全检查，不写入 migration 历史
 npm run db:baseline:apply # 检查通过后标记初始基线并应用增量 migration
 ```
 
-**当前真实 Docker 数据库已完成 baseline 和三条 migration（init、searchVector、Worker leasing），不要重复 baseline。** 日常升级使用 `npm run db:deploy`。详细条件、备份和恢复命令见维护指南。
+**当前真实 Docker 数据库已完成 baseline 和四条 migration：init、searchVector、Worker leasing、Repository 用户隔离；不要重复 baseline。** 日常升级使用 `npm run db:deploy`。详细条件、备份和恢复命令见维护指南。
 
 ### 4. 启动 Web 和 Worker
 
@@ -140,11 +153,11 @@ npm run dev:local
 | `npm run dev:local` | WSL PostgreSQL 旧一键启动 |
 | `npm run worker` | 启动后台分析 Worker |
 | `npm run typecheck` | TypeScript `--noEmit` |
-| `npm test` | 无数据库、无外部凭据的单元测试；P1 集中验证为 110 个通过 |
-| `npm run test:integration` | 在唯一 `gkh_test_*` 隔离库运行 migration/Token/Worker/search/business/startup 测试；P1 为 41 个通过 |
+| `npm test` | 无数据库、无外部凭据的单元测试；2026-11-04 集中验证为 212 个通过 |
+| `npm run test:integration` | 每个测试文件使用独立 `gkh_test_*` 数据库；2026-11-04 为 59 个通过 |
 | `npm run build` / `start` | Next.js 生产构建 / 启动 |
 | `npm run lint` | ESLint；忽略构建产物、本地工具和日志 |
-| `npm run db:deploy` | 应用三条版本化 migrations 并验证 generated column/GIN、leasing 字段/索引和 migration 历史 |
+| `npm run db:deploy` | 应用四条版本化 migrations，并验证 generated/GIN、leasing、用户维度唯一索引和 active Analysis 防重索引 |
 | `npm run db:baseline` / `db:baseline:apply` | 旧 `db push` 环境的安全检查 / 显式 baseline |
 | `npm run db:migrate` | 后续开发新 migration；先审查 diff，禁止用于绕过基线 |
 | `npm run db:push` | 保留的 Prisma 命令；不作为日常启动或既有数据升级方式 |
@@ -161,7 +174,7 @@ src/services/knowledge/  知识资产提取
 src/lib/                 Prisma/OpenAI/GitHub 客户端、加密 Adapter 和 Token 工具
 src/services/analysis/   Worker 原子领取、lease、heartbeat 与条件写入
 workers/                 独立分析 Worker
-prisma/migrations/       init、generated searchVector/GIN、Worker leasing 三条 migration
+prisma/migrations/       init、searchVector/GIN、Worker leasing、Repository 用户隔离
 scripts/                 启动、停止、migration、存量 Token 迁移和隔离测试工具
 tests/unit/              无网络单元测试
 tests/integration/       隔离 PostgreSQL 与启动测试
@@ -182,16 +195,14 @@ npm run build
 
 集成测试只从本地连接串派生唯一 `gkh_test_*` 数据库，创建前校验名称，结束后仅删除本次创建的测试库；不会 reset 或清空真实开发库。真实 OAuth/LLM 端到端测试必须单独人工验收，不能因缺少凭据而伪造通过。
 
-GitHub Actions 在 push / pull_request 时运行两个 Ubuntu jobs：`check` 执行 npm ci、Prisma、typecheck、ESLint、单元测试和 build；`integration` 启动临时 PostgreSQL/pgvector，执行 migration deploy 与集成测试。CI 只使用 dummy secrets，远程状态以实际 Actions 记录为准。
+GitHub Actions 在 push / pull_request 时运行两个 Ubuntu jobs：`check` 执行 npm ci、Prisma、typecheck、ESLint、单元测试和 build；`integration` 启动临时 PostgreSQL/pgvector，执行 migration deploy 与集成测试。CI 不使用真实业务凭据，测试 Token 加密密钥由 `openssl` 动态生成，外部 AI 使用 Mock。远程状态以实际 Actions 记录为准。
 
 真实 OAuth Secret、API Key、Access Token、数据库备份和本地 `.env` 不得进入版本控制。`db-backups/`、日志、PID 和测试产物均被 Git 忽略。
 
 ## 当前优先事项
 
-P1 的 Token 新写入加密、Worker leasing、CI 配置和业务回归已完成；真实存量 Token 迁移及外部服务验收仍有明确边界。下一阶段优先：
+1. 对真实存量 Account Token 先执行 dry-run 和备份审查，只有明确批准后才执行加密迁移。
+2. 分别验收真实 OAuth、GitHub 仓库同步、LLM 和 Embedding 外部服务，不能以 Mock 测试替代。
+3. 继续保持日常启动与 schema 维护分离；真实 migration 必须先备份、审查冲突并在隔离库演练。
 
-1. 统一单个/批量摘要的同步与 Worker 队列执行链，补齐幂等、缓存和重试语义。
-2. 真正持久化并校验 difficulty，让现有筛选产生有效结果。
-3. 采集真实 `tokensUsed` / `durationMs`，统一同步与 Worker 的成本和耗时观测。
-
-详细状态与验收标准见 [DEVELOPMENT_ROADMAP.md](docs/DEVELOPMENT_ROADMAP.md)。
+详细状态与验收标准见 [开发路线图](docs/DEVELOPMENT_ROADMAP.md)。
