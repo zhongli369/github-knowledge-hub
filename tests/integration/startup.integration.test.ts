@@ -22,8 +22,11 @@ async function availablePort(): Promise<number> {
   })
 }
 
+// Linux CI runs every database suite; only the PowerShell/Win32 launcher smoke test is skipped.
+const windowsIt = process.platform === "win32" ? it : it.skip
+
 describe("desktop launcher smoke test", () => {
-  it("starts and stops isolated Web and Worker processes without touching the real database", async () => {
+  windowsIt("starts and stops isolated Web and Worker processes without touching the real database", async () => {
     const databaseUrl = process.env.GKH_TEST_FRESH_DATABASE_URL!
     const runId = process.env.GKH_TEST_RUNTIME_ID!
     const port = await availablePort()

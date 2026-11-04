@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # CI-only placeholders. No repository or production secrets are used.
+  DATABASE_URL: postgresql://postgres:postgres@localhost:5432/github_knowledge_hub?schema=public
+  AUTH_SECRET: ci-only-dummy-auth-secret-0123456789abcdef-0123456789abcdef
+  AUTH_GITHUB_ID: ci-dummy-github-client-id
+  AUTH_GITHUB_SECRET: ci-dummy-github-client-secret
+  OPENAI_API_KEY: ci-dummy-openai-api-key
+  TOKEN_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+
+jobs:
+  check:
+    name: Static checks and unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Generate Prisma Client
+        run: npx prisma generate
+      - name: Validate Prisma schema
+        run: npx prisma validate
+      - name: Typecheck
+        run: npm run typecheck
+      - name: ESLint
+        run: npm run lint
+      - name: Unit tests
+        run: npm test
+      - name: Next.js build
+        run: npm run build
+
+  integration:
+    name: PostgreSQL integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Generate Prisma Client
+        run: npx prisma generate
+      - name: Start temporary PostgreSQL and pgvector
+        run: docker compose -f docker-compose.yml up -d
+      - name: Wait for PostgreSQL
+        run: |
+          for attempt in {1..60}; do
+            if docker exec github-knowledge-hub-db pg_isready -U postgres -d github_knowledge_hub; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "PostgreSQL did not become ready" >&2
+          exit 1
+      - name: Deploy Prisma migrations
+        run: npm run db:deploy
+      - name: Run isolated integration tests
+        run: npm run test:integration
+      - name: Tear down temporary CI database
+        if: always()
+        run: docker compose -f docker-compose.yml down -v
