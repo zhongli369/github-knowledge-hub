@@ -24,6 +24,7 @@ import { prisma } from "@/lib/prisma"
 import { enqueueAssetExtraction, REPOSITORY_NOT_FOUND_ERROR } from "@/services/intake"
 import { extractFromFile, extractWithLLM, extractAssetsFromRepo } from "@/services/knowledge/extraction.service"
 import { analyzeRepoSummary } from "@/services/llm/analysis.service"
+import { claimNextAnalysis, completeAnalysis } from "@/services/analysis/leasing.service"
 import { syncRepoToDb, type GitHubRepo } from "@/services/github/repos.service"
 
 const SUMMARY_JSON = JSON.stringify({
@@ -44,6 +45,17 @@ function vector(index: number): number[] {
   const values = Array<number>(1536).fill(0)
   values[index] = 1
   return values
+}
+
+function deferredSummaryCompletion() {
+  let resolve!: (value: { choices: Array<{ message: { content: string } }> }) => void
+  const promise = new Promise<{ choices: Array<{ message: { content: string } }> }>((res) => {
+    resolve = res
+  })
+  return {
+    promise,
+    complete: () => resolve({ choices: [{ message: { content: SUMMARY_JSON } }] }),
+  }
 }
 
 const savedKey = process.env.OPENAI_API_KEY
@@ -292,29 +304,105 @@ describe("LLM repo summary against the real database", () => {
     defaultBranch: "main",
   }
 
-  it("persists the completed summary and serves the second call from cache", async () => {
-    const first = await analyzeRepoSummary("p1x-repo-2", "p1x-user", repoMeta, "# Readme")
+  it("keeps a live direct analysis leased, clears its lease on completion, and serves cache", async () => {
+    // Remove queue rows left by the preceding enqueue tests so only this direct
+    // analysis is claimable by the recovery worker.
+    await prisma.analysis.deleteMany({ where: { userId: "p1x-user" } })
+    const deferred = deferredSummaryCompletion()
+    mocks.openaiCreate.mockReturnValue(deferred.promise)
 
-    expect(first.cached).toBe(false)
-    expect(first.summary.oneLine).toBe("A sample repo")
+    const pending = analyzeRepoSummary("p1x-repo-2", "p1x-user", repoMeta, "# Readme")
+    await vi.waitFor(() => expect(mocks.openaiCreate).toHaveBeenCalledTimes(1))
 
-    const stored = await prisma.analysis.findFirst({
+    const running = await prisma.analysis.findFirstOrThrow({
       where: {
         repositoryId: "p1x-repo-2",
         userId: "p1x-user",
         analysisType: "repo_summary",
-        status: "completed",
+        status: "running",
       },
     })
-    expect(stored).not.toBeNull()
-    expect(mocks.openaiCreate).toHaveBeenCalledTimes(1)
+    expect(running.workerId).toBe("direct:server-action")
+    expect(running.attempts).toBe(0)
+    expect(running.claimedAt).not.toBeNull()
+    expect(running.leaseExpiresAt!.getTime()).toBeGreaterThan(Date.now())
+    expect(await claimNextAnalysis({ workerId: "too-early-recovery" })).toBeNull()
+
+    deferred.complete()
+    const first = await pending
+    expect(first.cached).toBe(false)
+    expect(first.summary.oneLine).toBe("A sample repo")
+
+    const stored = await prisma.analysis.findUniqueOrThrow({ where: { id: running.id } })
+    expect(stored).toMatchObject({
+      status: "completed",
+      workerId: null,
+      claimedAt: null,
+      leaseExpiresAt: null,
+    })
 
     vi.clearAllMocks()
 
-    // Cache hits should not call the LLM again
+    // Cache hits should not call the LLM again.
     const second = await analyzeRepoSummary("p1x-repo-2", "p1x-user", repoMeta, "# Readme")
     expect(second.cached).toBe(true)
     expect(second.summary).toEqual(first.summary)
     expect(mocks.openaiCreate).not.toHaveBeenCalled()
+  })
+
+  it("recovers an expired direct lease without letting the stale request overwrite it", async () => {
+    await prisma.analysis.deleteMany({
+      where: { repositoryId: "p1x-repo-2", userId: "p1x-user" },
+    })
+    const deferred = deferredSummaryCompletion()
+    mocks.openaiCreate.mockReturnValue(deferred.promise)
+
+    const staleRequest = analyzeRepoSummary("p1x-repo-2", "p1x-user", repoMeta, "# Readme")
+    await vi.waitFor(() => expect(mocks.openaiCreate).toHaveBeenCalledTimes(1))
+    const running = await prisma.analysis.findFirstOrThrow({
+      where: {
+        repositoryId: "p1x-repo-2",
+        userId: "p1x-user",
+        analysisType: "repo_summary",
+        status: "running",
+      },
+    })
+
+    // Simulate a crashed/timed-out direct request becoming eligible for recovery.
+    await prisma.analysis.update({
+      where: { id: running.id },
+      data: { leaseExpiresAt: new Date(Date.now() - 1_000) },
+    })
+    const recovered = await claimNextAnalysis({ workerId: "recovery-worker" })
+    expect(recovered).toMatchObject({
+      id: running.id,
+      workerId: "recovery-worker",
+      attempts: 1,
+    })
+
+    // The old request may return to its caller, but its conditional DB write must
+    // lose to the newer worker's fencing token and leave the new lease untouched.
+    deferred.complete()
+    const staleResult = await staleRequest
+    const afterStaleWrite = await prisma.analysis.findUniqueOrThrow({ where: { id: running.id } })
+    expect(afterStaleWrite).toMatchObject({
+      status: "running",
+      workerId: "recovery-worker",
+      attempts: 1,
+      result: null,
+    })
+    expect(afterStaleWrite.leaseExpiresAt).toEqual(recovered!.leaseExpiresAt)
+
+    expect(await completeAnalysis({
+      analysisId: running.id,
+      workerId: "recovery-worker",
+      fencingToken: recovered!.attempts,
+      status: "completed",
+      result: JSON.parse(JSON.stringify({ summary: staleResult.summary })),
+    })).toBe(true)
+    expect(await prisma.analysis.findUniqueOrThrow({ where: { id: running.id } })).toMatchObject({
+      status: "completed",
+      leaseExpiresAt: null,
+    })
   })
 })

@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   openaiCreate: vi.fn(),
   findFirst: vi.fn(),
   update: vi.fn(),
+  updateMany: vi.fn(),
   create: vi.fn(),
   deleteMany: vi.fn(),
   generateRepoEmbedding: vi.fn(),
@@ -20,6 +21,7 @@ vi.mock("@/lib/prisma", () => ({
     analysis: {
       findFirst: mocks.findFirst,
       update: mocks.update,
+      updateMany: mocks.updateMany,
       create: mocks.create,
       deleteMany: mocks.deleteMany,
     },
@@ -80,6 +82,7 @@ beforeEach(() => {
   process.env.OPENAI_API_KEY = "sk-test-not-real"
   process.env.LLM_RETRY_BASE_DELAY_MS = "0" // keep retry tests fast
   mocks.update.mockResolvedValue({})
+  mocks.updateMany.mockResolvedValue({ count: 1 })
   mocks.generateRepoEmbedding.mockResolvedValue(true)
   mocks.completeAnalysis.mockResolvedValue(true)
 })
@@ -104,13 +107,31 @@ describe("analyzeRepoSummary — direct path", () => {
     expect(result.cached).toBe(false)
     expect(result.summary).toEqual(summary)
     expect(mocks.openaiCreate).toHaveBeenCalledTimes(1)
-    expect(mocks.update).toHaveBeenLastCalledWith({
-      where: { id: "analysis-1" },
+    const createData = mocks.create.mock.calls[0][0].data
+    expect(createData).toEqual(expect.objectContaining({
+      status: "running",
+      workerId: "direct:server-action",
+      attempts: 0,
+      claimedAt: expect.any(Date),
+      leaseExpiresAt: expect.any(Date),
+    }))
+    expect(createData.leaseExpiresAt.getTime() - createData.claimedAt.getTime()).toBe(10 * 60_000)
+    expect(mocks.updateMany).toHaveBeenLastCalledWith({
+      where: expect.objectContaining({
+        id: "analysis-1",
+        status: "running",
+        workerId: "direct:server-action",
+        attempts: 0,
+        leaseExpiresAt: { gt: expect.any(Date) },
+      }),
       data: expect.objectContaining({
         status: "completed",
         result: expect.objectContaining({ summary }),
         tokensUsed: 150,
         durationMs: expect.any(Number),
+        workerId: null,
+        claimedAt: null,
+        leaseExpiresAt: null,
       }),
     })
     // embedding is best-effort, fired after completion
@@ -124,8 +145,8 @@ describe("analyzeRepoSummary — direct path", () => {
 
     await analyzeRepoSummary("repo-1", "user-1", repoMeta, "# Hello")
 
-    expect(mocks.update).toHaveBeenLastCalledWith({
-      where: { id: "analysis-no-usage" },
+    expect(mocks.updateMany).toHaveBeenLastCalledWith({
+      where: expect.objectContaining({ id: "analysis-no-usage" }),
       data: expect.objectContaining({
         status: "completed",
         tokensUsed: 0,
@@ -145,8 +166,8 @@ describe("analyzeRepoSummary — direct path", () => {
 
     expect(result.cached).toBe(false)
     expect(mocks.openaiCreate).toHaveBeenCalledTimes(2)
-    expect(mocks.update).toHaveBeenLastCalledWith({
-      where: { id: "analysis-retry-429" },
+    expect(mocks.updateMany).toHaveBeenLastCalledWith({
+      where: expect.objectContaining({ id: "analysis-retry-429" }),
       data: expect.objectContaining({ status: "completed", tokensUsed: 77 }),
     })
   })
@@ -174,7 +195,7 @@ describe("analyzeRepoSummary — direct path", () => {
     expect(result.summary).toEqual(summary)
     expect(mocks.openaiCreate).not.toHaveBeenCalled()
     expect(mocks.create).not.toHaveBeenCalled()
-    expect(mocks.update).not.toHaveBeenCalled()
+    expect(mocks.updateMany).not.toHaveBeenCalled()
   })
 
   it("throws API_KEY_MISSING before creating a record when the key is unset and no cache exists", async () => {
@@ -198,9 +219,14 @@ describe("analyzeRepoSummary — direct path", () => {
     await expect(analyzeRepoSummary("repo-1", "user-1", repoMeta, null)).rejects.toMatchObject({
       code: "LLM_JSON_PARSE_FAILED",
     })
-    expect(mocks.update).toHaveBeenLastCalledWith({
-      where: { id: "analysis-2" },
-      data: expect.objectContaining({ status: "failed" }),
+    expect(mocks.updateMany).toHaveBeenLastCalledWith({
+      where: expect.objectContaining({ id: "analysis-2" }),
+      data: expect.objectContaining({
+        status: "failed",
+        workerId: null,
+        claimedAt: null,
+        leaseExpiresAt: null,
+      }),
     })
   })
 
@@ -212,8 +238,8 @@ describe("analyzeRepoSummary — direct path", () => {
     await expect(analyzeRepoSummary("repo-1", "user-1", repoMeta, null)).rejects.toMatchObject({
       code: "API_KEY_MISSING",
     })
-    expect(mocks.update).toHaveBeenLastCalledWith({
-      where: { id: "analysis-3" },
+    expect(mocks.updateMany).toHaveBeenLastCalledWith({
+      where: expect.objectContaining({ id: "analysis-3" }),
       data: expect.objectContaining({
         status: "failed",
         error: expect.stringContaining("API key is invalid or missing"),

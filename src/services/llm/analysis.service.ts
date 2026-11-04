@@ -16,6 +16,9 @@ type RepoSummaryLLMResponse = OpenAICompletionResponseLike & {
 }
 
 const PROMPT_VERSION = "repo-summary-v1"
+const DIRECT_ANALYSIS_WORKER_ID = "direct:server-action"
+const DIRECT_ANALYSIS_LEASE_MS = 10 * 60_000
+const DIRECT_ANALYSIS_FENCING_TOKEN = 0
 
 function getModel(): string {
   return process.env.OPENAI_MODEL || "gpt-4o-mini"
@@ -130,7 +133,10 @@ export async function analyzeRepoSummary(
     )
   }
 
-  // 3. Create analysis record
+  // 3. Create analysis record. Direct Server Actions do not heartbeat, so use
+  // a finite recovery lease: a live request is not immediately reclaimed as a
+  // NULL-lease crash, while a genuinely crashed request becomes recoverable.
+  const claimedAt = new Date()
   const analysis = await prisma.analysis.create({
     data: {
       analysisType: "repo_summary",
@@ -143,26 +149,47 @@ export async function analyzeRepoSummary(
       },
       repositoryId: repoId,
       userId,
+      workerId: DIRECT_ANALYSIS_WORKER_ID,
+      attempts: DIRECT_ANALYSIS_FENCING_TOKEN,
+      claimedAt,
+      leaseExpiresAt: new Date(claimedAt.getTime() + DIRECT_ANALYSIS_LEASE_MS),
     },
   })
 
+  const directClaim = () => ({
+    id: analysis.id,
+    status: "running",
+    workerId: DIRECT_ANALYSIS_WORKER_ID,
+    attempts: DIRECT_ANALYSIS_FENCING_TOKEN,
+    leaseExpiresAt: { gt: new Date() },
+  })
   const overallStartedAt = Date.now()
 
   try {
     const { summary, metrics } = await executeRepoSummaryCall(repoMeta, readme)
 
-    await prisma.analysis.update({
-      where: { id: analysis.id },
+    // The attempts value fences this direct execution. If its lease expired and
+    // a worker reclaimed the row, attempts changed and this stale request must
+    // not overwrite or clear the replacement worker's claim/result.
+    const completed = await prisma.analysis.updateMany({
+      where: directClaim(),
       data: {
         status: "completed",
         result: JSON.parse(JSON.stringify({ summary, rawContent: summary.oneLine })),
         tokensUsed: metrics.tokensUsed ?? 0,
         durationMs: metrics.durationMs,
+        workerId: null,
+        claimedAt: null,
+        leaseExpiresAt: null,
       },
     })
 
-    // Best-effort embedding generation
-    tryEmbedding(repoId, userId)
+    if (completed.count === 1) {
+      // Best-effort embedding generation, only if this execution still owns the row.
+      tryEmbedding(repoId, userId)
+    } else {
+      console.warn(`[direct] Lost lease for ${analysis.id}; repo summary result discarded`)
+    }
 
     return { summary, cached: false }
   } catch (error) {
@@ -171,12 +198,15 @@ export async function analyzeRepoSummary(
     // back to the wall time we spent in this block so failed tasks still carry
     // a meaningful durationMs.
     analysisError.durationMs ??= Math.max(0, Date.now() - overallStartedAt)
-    await prisma.analysis.update({
-      where: { id: analysis.id },
+    await prisma.analysis.updateMany({
+      where: directClaim(),
       data: {
         status: "failed",
         error: analysisError.message.slice(0, 1000),
         durationMs: analysisError.durationMs,
+        workerId: null,
+        claimedAt: null,
+        leaseExpiresAt: null,
       },
     })
     throw analysisError
