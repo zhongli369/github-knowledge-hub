@@ -11,10 +11,16 @@ async function getLibraryItems(): Promise<LibraryItem[]> {
   if (repos.length === 0) return []
 
   const repoIds = repos.map((r) => r.id)
+  const viewerId = repos[0]?.userId ?? ""
   const [analyses, freshnessMap] = await Promise.all([
+    // The repositoryId set is already the viewer's own repos, but the Analysis
+    // query is additionally scoped by userId so a stray Analysis row created
+    // with the viewer's repositoryId but another user's userId can never leak
+    // into (or shadow) the viewer's Library status.
     prisma.analysis.findMany({
       where: {
         repositoryId: { in: repoIds },
+        userId: viewerId,
         analysisType: "repo_summary",
       },
       select: {
@@ -28,7 +34,7 @@ async function getLibraryItems(): Promise<LibraryItem[]> {
       orderBy: { createdAt: "desc" },
     }),
     // Batch freshness — timestamp comparison only, no textHash rebuild
-    checkEmbeddingFreshnessBatch(repoIds, repos[0]?.userId ?? ""),
+    checkEmbeddingFreshnessBatch(repoIds, viewerId),
   ])
   const analysisMap = new Map(analyses.map((a) => [a.repositoryId!, a]))
 

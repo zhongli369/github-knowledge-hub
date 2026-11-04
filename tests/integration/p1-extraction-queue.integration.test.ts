@@ -21,7 +21,7 @@ vi.mock("@/services/github", () => ({
 }))
 
 import { prisma } from "@/lib/prisma"
-import { enqueueAssetExtraction } from "@/services/intake"
+import { enqueueAssetExtraction, REPOSITORY_NOT_FOUND_ERROR } from "@/services/intake"
 import { extractFromFile, extractWithLLM, extractAssetsFromRepo } from "@/services/knowledge/extraction.service"
 import { analyzeRepoSummary } from "@/services/llm/analysis.service"
 
@@ -99,6 +99,45 @@ describe("intake queue behaviour against the real database", () => {
 
     const second = await enqueueAssetExtraction("p1x-repo-1", "p1x-user")
     expect(second.status).toBe("already_queued")
+  })
+
+  it("refuses to enqueue asset extraction against a repository owned by another user", async () => {
+    // A second user must not be able to queue work against p1x-repo-1, which the
+    // p1x-user owns (P1 cross-user isolation regression).
+    await prisma.user.create({
+      data: { id: "p1x-intruder", name: "Intruder", updatedAt: new Date() },
+    })
+
+    const result = await enqueueAssetExtraction("p1x-repo-1", "p1x-intruder")
+
+    expect(result.status).toBe("error")
+    expect(result.error).toBe(REPOSITORY_NOT_FOUND_ERROR)
+    const rows = await prisma.analysis.findMany({
+      where: { repositoryId: "p1x-repo-1", userId: "p1x-intruder" },
+    })
+    expect(rows).toHaveLength(0)
+  })
+
+  it("collapses concurrent enqueues to a single pending row (requires the active partial unique index)", async () => {
+    const results = await Promise.all([
+      enqueueAssetExtraction("p1x-repo-2", "p1x-user"),
+      enqueueAssetExtraction("p1x-repo-2", "p1x-user"),
+    ])
+
+    const queued = results.filter((r) => r.status === "queued")
+    const dups = results.filter((r) => r.status === "already_queued")
+    expect(queued.length + dups.length).toBe(2)
+    expect(queued.length).toBe(1)
+
+    const active = await prisma.analysis.findMany({
+      where: {
+        repositoryId: "p1x-repo-2",
+        userId: "p1x-user",
+        analysisType: "asset_extraction",
+        status: { in: ["pending", "running"] },
+      },
+    })
+    expect(active).toHaveLength(1)
   })
 })
 

@@ -90,7 +90,7 @@ export default async function DashboardPage() {
   const repoMap = new Map<string, string>()
   if (repoIds.length > 0) {
     const repos = await prisma.repository.findMany({
-      where: { id: { in: repoIds } },
+      where: { id: { in: repoIds }, userId },
       select: { id: true, fullName: true },
     })
     for (const r of repos) repoMap.set(r.id, r.fullName)

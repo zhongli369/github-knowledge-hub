@@ -9,6 +9,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 const initialMigration = "20261103230000_init"
 const searchMigration = "20261103231000_repository_search_vector"
 const workerLeasingMigration = "20261104101530_analysis_worker_leasing"
+const repositoryIsolationMigration = "20261104190000_repository_user_isolation"
 const prismaCli = path.join(root, "node_modules", "prisma", "build", "index.js")
 
 if (!process.env.DATABASE_URL && existsSync(path.join(root, ".env"))) {
@@ -83,16 +84,44 @@ async function verifyMigratedSchema(prisma) {
     throw new Error("Analysis_status_leaseExpiresAt_idx is missing")
   }
 
+  const repositoryIndexes = await prisma.$queryRawUnsafe(`
+    SELECT indexname, indexdef FROM pg_indexes
+    WHERE schemaname = 'public' AND tablename = 'Repository'
+      AND indexname IN (
+        'Repository_userId_githubId_key',
+        'Repository_userId_fullName_key'
+      )
+  `)
+  if (
+    repositoryIndexes.length !== 2 ||
+    repositoryIndexes.some((index) => !index.indexdef.includes("UNIQUE INDEX"))
+  ) {
+    throw new Error("Repository per-user unique indexes are missing")
+  }
+
+  const activeAnalysisIndexes = await prisma.$queryRawUnsafe(`
+    SELECT indexdef FROM pg_indexes
+    WHERE schemaname = 'public' AND tablename = 'Analysis'
+      AND indexname = 'Analysis_active_repository_user_type_key'
+  `)
+  if (
+    activeAnalysisIndexes.length !== 1 ||
+    !activeAnalysisIndexes[0].indexdef.includes("UNIQUE INDEX") ||
+    !activeAnalysisIndexes[0].indexdef.includes("WHERE")
+  ) {
+    throw new Error("Analysis active-task partial unique index is missing")
+  }
+
   const migrations = await prisma.$queryRawUnsafe(`
     SELECT migration_name, finished_at, rolled_back_at
     FROM "_prisma_migrations"
-    WHERE migration_name IN ($1, $2, $3)
-  `, initialMigration, searchMigration, workerLeasingMigration)
+    WHERE migration_name IN ($1, $2, $3, $4)
+  `, initialMigration, searchMigration, workerLeasingMigration, repositoryIsolationMigration)
   if (
-    migrations.length !== 3 ||
+    migrations.length !== 4 ||
     migrations.some((migration) => !migration.finished_at || migration.rolled_back_at)
   ) {
-    throw new Error("Prisma migration history does not contain all three successful migrations")
+    throw new Error("Prisma migration history does not contain all four successful migrations")
   }
 }
 
@@ -129,6 +158,12 @@ async function assertBaselineEligible(prisma) {
     "--script",
   ], true).replaceAll("\r\n", "\n").trim()
   const expectedLegacyDiff = [
+    "-- DropIndex",
+    'DROP INDEX "Repository_fullName_key";',
+    "",
+    "-- DropIndex",
+    'DROP INDEX "Repository_githubId_key";',
+    "",
     "-- AlterTable",
     'ALTER TABLE "Analysis" ADD COLUMN     "attempts" INTEGER NOT NULL DEFAULT 0,',
     'ADD COLUMN     "claimedAt" TIMESTAMP(3),',
@@ -140,6 +175,12 @@ async function assertBaselineEligible(prisma) {
     "",
     "-- CreateIndex",
     'CREATE INDEX "Repository_searchVector_idx" ON "Repository" USING GIN ("searchVector");',
+    "",
+    "-- CreateIndex",
+    'CREATE UNIQUE INDEX "Repository_userId_githubId_key" ON "Repository"("userId", "githubId");',
+    "",
+    "-- CreateIndex",
+    'CREATE UNIQUE INDEX "Repository_userId_fullName_key" ON "Repository"("userId", "fullName");',
   ].join("\n")
   if (diff !== expectedLegacyDiff) {
     throw new Error(`Database differs from the legacy schema in unexpected ways; baseline refused.\n${diff}`)
@@ -173,7 +214,7 @@ try {
 
   if (command === "deploy" || execute) {
     await verifyMigratedSchema(prisma)
-    console.log("Verified generated searchVector, GIN index, worker leasing fields, and successful migration history.")
+    console.log("Verified searchVector, leasing fields, per-user repository keys, active-analysis uniqueness, and all migration history.")
   }
 } finally {
   await prisma.$disconnect()

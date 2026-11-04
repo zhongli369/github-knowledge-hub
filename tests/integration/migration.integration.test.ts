@@ -62,6 +62,7 @@ describe("Prisma migrations in isolated databases", () => {
         "20261103230000_init",
         "20261103231000_repository_search_vector",
         "20261104101530_analysis_worker_leasing",
+        "20261104190000_repository_user_isolation",
       ])
 
       const generated = await prisma.$queryRawUnsafe<Array<{ attgenerated: string; expression: string }>>(`

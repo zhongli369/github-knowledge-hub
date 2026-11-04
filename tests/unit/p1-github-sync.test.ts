@@ -157,12 +157,34 @@ describe("GitHub repo fetch and sync (Octokit mocked)", () => {
     expect(await fetchRepoReadme("user-1", "octocat", "hello-world")).toBe("# Hello\n\nA demo")
   })
 
-  it("returns null when the README cannot be fetched", async () => {
+  it("returns null only for a genuine 404 README response", async () => {
     mocks.createOctokit.mockResolvedValue(
-      fakeOctokit({ repos: { getReadme: vi.fn().mockRejectedValue(new Error("404")) } }),
+      fakeOctokit({
+        repos: {
+          getReadme: vi.fn().mockRejectedValue(Object.assign(new Error("Not Found"), { status: 404 })),
+        },
+      }),
     )
 
     expect(await fetchRepoReadme("user-1", "octocat", "missing")).toBeNull()
+  })
+
+  it.each([403, 429, 500])("surfaces GitHub README status %i instead of treating it as missing", async (status) => {
+    mocks.createOctokit.mockResolvedValue(
+      fakeOctokit({
+        repos: { getReadme: vi.fn().mockRejectedValue(Object.assign(new Error("upstream"), { status })) },
+      }),
+    )
+
+    await expect(fetchRepoReadme("user-1", "octocat", "hello-world")).rejects.toMatchObject({ status })
+  })
+
+  it("surfaces README network failures instead of treating them as missing", async () => {
+    mocks.createOctokit.mockResolvedValue(
+      fakeOctokit({ repos: { getReadme: vi.fn().mockRejectedValue(new Error("socket reset")) } }),
+    )
+
+    await expect(fetchRepoReadme("user-1", "octocat", "hello-world")).rejects.toThrow(/socket reset/)
   })
 
   it("maps single-repo details", async () => {
@@ -201,11 +223,13 @@ describe("GitHub repo fetch and sync (Octokit mocked)", () => {
 
     expect(mocks.upsert).toHaveBeenCalledTimes(1)
     const { where, create, update } = mocks.upsert.mock.calls[0][0] as {
-      where: { githubId: number }
+      where: { userId_githubId: { userId: string; githubId: number } }
       create: Record<string, unknown>
       update: Record<string, unknown>
     }
-    expect(where).toEqual({ githubId: 123 })
+    // Per-user compound key: the upsert is scoped to (userId, githubId) so each
+    // user gets their own Repository row for the same GitHub repository.
+    expect(where).toEqual({ userId_githubId: { userId: "user-1", githubId: 123 } })
     expect(create).toMatchObject({
       githubId: 123,
       owner: "octocat",
@@ -278,6 +302,53 @@ describe("GitHub repo fetch and sync (Octokit mocked)", () => {
     expect(update.pushedAt).toBeNull()
   })
 
+  it("lets two users sync the same GitHub repository into independent rows", async () => {
+    mocks.upsert.mockResolvedValue({ id: "db-repo" })
+
+    const repo: GitHubRepo = {
+      id: 123,
+      owner: "octocat",
+      name: "hello-world",
+      fullName: "octocat/hello-world",
+      description: "A demo repository",
+      url: "https://github.com/octocat/hello-world",
+      homepage: null,
+      language: "TypeScript",
+      stars: 50,
+      forks: 4,
+      topics: ["api"],
+      defaultBranch: "main",
+      isArchived: false,
+      isTemplate: false,
+      license: null,
+      size: 200,
+      pushedAt: null,
+    }
+
+    // User A syncs the repo, then user B syncs the same GitHub repository.
+    await syncRepoToDb("user-a", repo)
+    await syncRepoToDb("user-b", repo)
+
+    expect(mocks.upsert).toHaveBeenCalledTimes(2)
+    const first = mocks.upsert.mock.calls[0][0] as {
+      where: { userId_githubId: { userId: string; githubId: number } }
+      create: Record<string, unknown>
+    }
+    const second = mocks.upsert.mock.calls[1][0] as {
+      where: { userId_githubId: { userId: string; githubId: number } }
+      create: Record<string, unknown>
+    }
+
+    // Each upsert is keyed on its own (userId, githubId) and creates its own row.
+    expect(first.where).toEqual({ userId_githubId: { userId: "user-a", githubId: 123 } })
+    expect(first.create.userId).toBe("user-a")
+    expect(first.create.fullName).toBe("octocat/hello-world")
+
+    expect(second.where).toEqual({ userId_githubId: { userId: "user-b", githubId: 123 } })
+    expect(second.create.userId).toBe("user-b")
+    expect(second.create.fullName).toBe("octocat/hello-world")
+  })
+
   it("loads user repos ordered by stars descending", async () => {
     mocks.findMany.mockResolvedValue([{ id: "repo-2" }, { id: "repo-1" }])
     const rows = await getUserReposFromDb("user-1")
@@ -290,9 +361,12 @@ describe("GitHub repo fetch and sync (Octokit mocked)", () => {
   })
 })
 
-describe("fetchRepoFileTree filtering and fallback", () => {
+describe("fetchRepoFileTree filtering and failure handling", () => {
   const tree: FakeTreeEntry[] = [
     { path: "node_modules/foo/index.js", type: "blob", size: 10 },
+    { path: "packages/demo/node_modules/nested.js", type: "blob", size: 10 },
+    { path: "packages/demo/dist/generated.js", type: "blob", size: 10 },
+    { path: "packages/demo/__pycache__/cache.py", type: "blob", size: 10 },
     { path: ".git/config", type: "blob", size: 50 },
     { path: "src/app.min.js", type: "blob", size: 100 },
     { path: "src/app.map.js", type: "blob", size: 100 },
@@ -344,32 +418,34 @@ describe("fetchRepoFileTree filtering and fallback", () => {
     expect(entries).toHaveLength(200)
   })
 
-  it("falls back to a non-recursive tree when the recursive call is too large", async () => {
-    const getTree = vi
-      .fn()
-      .mockRejectedValueOnce(new Error("tree too large for this repo"))
-      .mockResolvedValueOnce({
-        data: { tree: [{ path: "src/top.ts", type: "blob", size: 10 }] },
-      })
+  it("rejects a truncated recursive tree instead of extracting a partial repository", async () => {
+    const getTree = vi.fn().mockResolvedValue({
+      data: { truncated: true, tree: [{ path: "src/partial.ts", type: "blob", size: 10 }] },
+    })
     mocks.createOctokit.mockResolvedValue(fakeOctokit({ git: { getTree } }))
 
-    const entries = await fetchRepoFileTree("user-1", "octocat", "hello-world", "main")
-
-    expect(getTree).toHaveBeenCalledTimes(2)
-    expect(entries).toEqual([{ path: "src/top.ts", type: "file", size: 10 }])
+    await expect(fetchRepoFileTree("user-1", "octocat", "hello-world", "main")).rejects.toThrow(/truncated tree/)
+    expect(getTree).toHaveBeenCalledTimes(1)
   })
 
-  it("returns an empty list for unrelated errors", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+  it("surfaces rate limits and transport errors instead of returning an empty tree", async () => {
     mocks.createOctokit.mockResolvedValue(
       fakeOctokit({
-        git: { getTree: vi.fn().mockRejectedValue(new Error("rate limited")) },
+        git: { getTree: vi.fn().mockRejectedValue(Object.assign(new Error("rate limited"), { status: 429 })) },
       }),
     )
 
-    expect(await fetchRepoFileTree("user-1", "octocat", "hello-world")).toEqual([])
-    expect(warn).toHaveBeenCalled()
-    warn.mockRestore()
+    await expect(fetchRepoFileTree("user-1", "octocat", "hello-world")).rejects.toMatchObject({ status: 429 })
+  })
+
+  it("returns an empty tree only for a genuine 404", async () => {
+    mocks.createOctokit.mockResolvedValue(
+      fakeOctokit({
+        git: { getTree: vi.fn().mockRejectedValue(Object.assign(new Error("Not Found"), { status: 404 })) },
+      }),
+    )
+
+    await expect(fetchRepoFileTree("user-1", "octocat", "hello-world")).resolves.toEqual([])
   })
 })
 
@@ -403,13 +479,27 @@ describe("fetchFileContent", () => {
     expect(await fetchFileContent("user-1", "o", "r", "nope")).toBeNull()
   })
 
-  it("returns null when the GitHub call fails", async () => {
+  it("returns null when the file genuinely does not exist", async () => {
     mocks.createOctokit.mockResolvedValue(
       fakeOctokit({
-        repos: { getContent: vi.fn().mockRejectedValue(new Error("404")) },
+        repos: {
+          getContent: vi.fn().mockRejectedValue(Object.assign(new Error("Not Found"), { status: 404 })),
+        },
       }),
     )
 
     expect(await fetchFileContent("user-1", "o", "r", "missing.ts")).toBeNull()
+  })
+
+  it("surfaces rate limits instead of skipping the file as missing", async () => {
+    mocks.createOctokit.mockResolvedValue(
+      fakeOctokit({
+        repos: {
+          getContent: vi.fn().mockRejectedValue(Object.assign(new Error("rate limited"), { status: 429 })),
+        },
+      }),
+    )
+
+    await expect(fetchFileContent("user-1", "o", "r", "limited.ts")).rejects.toMatchObject({ status: 429 })
   })
 })

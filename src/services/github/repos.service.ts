@@ -1,5 +1,6 @@
 import { createOctokit } from "@/lib/github/client"
 import { prisma } from "@/lib/prisma"
+import { classifyGitHubError, isNotFound } from "./errors"
 
 export interface GitHubRepo {
   id: number
@@ -79,8 +80,9 @@ export async function fetchRepoReadme(
     const { data } = await octokit.repos.getReadme({ owner, repo })
     const content = Buffer.from(data.content, "base64").toString("utf-8")
     return content
-  } catch {
-    return null
+  } catch (error) {
+    if (isNotFound(error)) return null
+    return classifyGitHubError(error)
   }
 }
 
@@ -98,8 +100,13 @@ export async function syncRepoToDb(
   userId: string,
   repo: GitHubRepo
 ): Promise<void> {
+  // Per-user upsert key: two users syncing the same GitHub repository must get
+  // their own Repository rows. The global-unique githubId/fullName constraints
+  // are replaced by compound (userId, githubId) / (userId, fullName) uniques so
+  // user B syncing a repo already tracked by user A creates B's own row instead
+  // of stealing/overwriting A's.
   await prisma.repository.upsert({
-    where: { githubId: repo.id },
+    where: { userId_githubId: { userId, githubId: repo.id } },
     create: {
       githubId: repo.id,
       owner: repo.owner,
@@ -164,6 +171,14 @@ const SKIP_FILE_PATTERNS = [/\.min\.js$/, /\.bundle\.js$/, /\.chunk\.js$/, /\.ma
 const MAX_FILE_SIZE = 500_000 // 500KB
 const MAX_TREE_ENTRIES = 200
 
+export class GitHubTreeTruncatedError extends Error {
+  override readonly name = "GitHubTreeTruncatedError"
+
+  constructor(owner: string, repo: string) {
+    super(`GitHub returned a truncated tree for ${owner}/${repo}; refusing partial extraction`)
+  }
+}
+
 export async function fetchRepoFileTree(
   userId: string,
   owner: string,
@@ -179,6 +194,10 @@ export async function fetchRepoFileTree(
       tree_sha: branch || "HEAD",
       recursive: "1" as unknown as undefined,
     })
+
+    if (data.truncated) {
+      throw new GitHubTreeTruncatedError(owner, repo)
+    }
 
     const entries: RepoFileEntry[] = []
     for (const item of data.tree) {
@@ -202,26 +221,9 @@ export async function fetchRepoFileTree(
 
     return entries
   } catch (error) {
-    const msg = error instanceof Error ? error.message : ""
-    if (msg.includes("tree too large") || msg.includes("too large")) {
-      // Fallback: non-recursive (top-level only)
-      const { data } = await octokit.git.getTree({
-        owner,
-        repo,
-        tree_sha: branch || "HEAD",
-      })
-      const entries: RepoFileEntry[] = []
-      for (const item of data.tree) {
-        if (!item.path || !item.type) continue
-        if (entries.length >= MAX_TREE_ENTRIES) break
-        if (item.type === "blob") {
-          entries.push({ path: item.path!, type: "file", size: item.size })
-        }
-      }
-      return entries
-    }
-    console.warn(`[github] Failed to fetch file tree for ${owner}/${repo}:`, msg)
-    return []
+    if (error instanceof GitHubTreeTruncatedError) throw error
+    if (isNotFound(error)) return []
+    return classifyGitHubError(error)
   }
 }
 
@@ -236,7 +238,8 @@ export async function fetchFileContent(
     const { data } = await octokit.repos.getContent({ owner, repo, path })
     if (Array.isArray(data) || !("content" in data) || !data.content) return null
     return Buffer.from(data.content, "base64").toString("utf-8")
-  } catch {
-    return null
+  } catch (error) {
+    if (isNotFound(error)) return null
+    return classifyGitHubError(error)
   }
 }

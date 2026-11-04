@@ -18,6 +18,10 @@ export async function extractAssetsAction(
 ): Promise<EnqueueResult> {
   const session = await auth()
   if (!session?.user?.id) throw new Error("Not authenticated")
+
+  // Ownership of `repositoryId` is enforced inside enqueueAssetExtraction: a
+  // missing or foreign repository yields status "error" and no Analysis row is
+  // created, so a user can never enqueue extraction against another user's repo.
   return enqueueAssetExtraction(repositoryId, session.user.id)
 }
 

@@ -6,7 +6,7 @@ import { enqueueRepoSummary } from "@/services/intake"
 
 export interface EnqueueActionResult {
   analysisId: string
-  status: "queued" | "already_completed" | "already_queued"
+  status: "queued" | "already_completed" | "already_queued" | "error"
   error?: string
 }
 
@@ -15,9 +15,12 @@ export async function enqueueAnalysisAction(
 ): Promise<EnqueueActionResult> {
   const session = await auth()
   if (!session?.user?.id) {
-    return { analysisId: "", status: "queued", error: "Not authenticated" }
+    return { analysisId: "", status: "error", error: "Not authenticated" }
   }
 
+  // Ownership of `repoId` is enforced inside enqueueRepoSummary: an illegal
+  // repositoryId (missing or owned by another user) yields status "error" and
+  // never creates an Analysis row.
   const result = await enqueueRepoSummary(repoId, session.user.id)
   revalidatePath("/library")
   revalidatePath(`/library/${repoId}`)
@@ -29,7 +32,7 @@ export async function enqueueBatchAction(
 ): Promise<{ results: EnqueueActionResult[] }> {
   const session = await auth()
   if (!session?.user?.id) {
-    return { results: repoIds.map(() => ({ analysisId: "", status: "queued" as const, error: "Not authenticated" })) }
+    return { results: repoIds.map(() => ({ analysisId: "", status: "error" as const, error: "Not authenticated" })) }
   }
 
   const results: EnqueueActionResult[] = []
