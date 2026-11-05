@@ -1,5 +1,6 @@
 import { createOctokit } from "@/lib/github/client"
 import { prisma } from "@/lib/prisma"
+import { enqueueRepoClassification } from "@/services/intake"
 import { classifyGitHubError, isNotFound } from "./errors"
 
 export interface GitHubRepo {
@@ -96,16 +97,53 @@ export async function fetchRepoDetails(
   return mapRepo(data as Parameters<typeof mapRepo>[0])
 }
 
+/** Ordered topics comparison so [a,b] === [b,a] for change detection. */
+function topicsEqual(a: string[] | null, b: string[] | null): boolean {
+  const left = a ?? []
+  const right = b ?? []
+  if (left.length !== right.length) return false
+  return [...left].sort().every((v, i) => v === [...right].sort()[i])
+}
+
+/**
+ * Persist a GitHub repository for a user and auto-enqueue auto-classification.
+ *
+ * Per-user upsert key: two users syncing the same GitHub repository must get
+ * their own Repository rows. The global-unique githubId/fullName constraints
+ * are replaced by compound (userId, githubId) / (userId, fullName) uniques so
+ * user B syncing a repo already tracked by user A creates B's own row instead
+ * of stealing/overwriting A's.
+ *
+ * Classification trigger (Agent D):
+ *   * a brand-new row enqueues `repo_classification` automatically;
+ *   * a row whose content-affecting metadata (description / language / topics)
+ *     changed also gets re-enqueued on demand.
+ * The worker's `classifyRepository` re-checks the content hash and skips when
+ * nothing actually changed, so no duplicate AI work is produced. The enqueue is
+ * best-effort — a queue failure never aborts the repository sync itself. No
+ * classification relation is written here (manual/excluded handling lives
+ * entirely in Agent A's classification library).
+ */
 export async function syncRepoToDb(
   userId: string,
   repo: GitHubRepo
 ): Promise<void> {
-  // Per-user upsert key: two users syncing the same GitHub repository must get
-  // their own Repository rows. The global-unique githubId/fullName constraints
-  // are replaced by compound (userId, githubId) / (userId, fullName) uniques so
-  // user B syncing a repo already tracked by user A creates B's own row instead
-  // of stealing/overwriting A's.
-  await prisma.repository.upsert({
+  // Detect create-vs-update (and content changes) so we only enqueue when it
+  // is actually warranted. This is the single Repository write path in the
+  // GitHub sync flow, so both `syncMyRepos` and `syncStarredRepos` benefit.
+  const existing = await prisma.repository.findUnique({
+    where: { userId_githubId: { userId, githubId: repo.id } },
+    select: { id: true, description: true, language: true, topics: true },
+  })
+
+  const isNew = !existing
+  const contentChanged =
+    !isNew &&
+    ((existing.description ?? null) !== (repo.description ?? null) ||
+      (existing.language ?? null) !== (repo.language ?? null) ||
+      !topicsEqual(existing.topics, repo.topics))
+
+  const saved = await prisma.repository.upsert({
     where: { userId_githubId: { userId, githubId: repo.id } },
     create: {
       githubId: repo.id,
@@ -141,6 +179,17 @@ export async function syncRepoToDb(
       lastFetchedAt: new Date(),
     },
   })
+
+  if (isNew || contentChanged) {
+    try {
+      await enqueueRepoClassification(saved.id, userId, { mode: "all", force: false })
+    } catch (error) {
+      console.warn(
+        `[sync] Failed to enqueue classification for ${repo.fullName}:`,
+        (error as Error).message,
+      )
+    }
+  }
 }
 
 export async function getUserReposFromDb(userId: string) {

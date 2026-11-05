@@ -3,6 +3,25 @@
 import { revalidatePath } from "next/cache"
 import { auth } from "@/auth"
 import { prisma } from "@/lib/prisma"
+import { REPO_CATEGORY_BY_SLUG } from "@/lib/classification/taxonomy"
+import {
+  listCategoryCollectionsForUser,
+  listCategoryRepositoriesForUser,
+  setRepositoryCategoryMembershipForUser,
+} from "@/lib/collections/category"
+
+import type {
+  CategoryCollectionSummary,
+  CategoryRepositoriesResult,
+  CategoryRepositoryQuery,
+} from "@/lib/collections/category"
+
+export type {
+  CategoryCollectionSummary,
+  CategoryRepositoriesResult,
+  CategoryRepositoryItem,
+  CategoryRepositoryQuery,
+} from "@/lib/collections/category"
 
 // ── Queries ───────────────────────────────────────────────────────
 
@@ -10,7 +29,7 @@ export async function getCollectionsAction() {
   const session = await auth()
   if (!session?.user?.id) throw new Error("Not authenticated")
   return prisma.collection.findMany({
-    where: { userId: session.user.id },
+    where: { userId: session.user.id, kind: "custom" },
     include: { _count: { select: { assets: true } } },
     orderBy: { updatedAt: "desc" },
   })
@@ -241,4 +260,64 @@ export async function removeFromCollectionAction(collectionId: string, assetId: 
   const result = await removeAssetsFromCollectionAction(collectionId, [assetId])
   revalidatePath(`/collections/${collectionId}`)
   return { success: true, removed: result.removed }
+}
+
+// ── Category collections (kind="category") ───────────────────────
+// Business logic lives in @/lib/collections/category with an explicit userId
+// parameter so it is unit-testable and every query/write is user-scoped. These
+// server actions resolve the authed session id and delegate; they never accept
+// a userId/repositoryId/collectionId without validating ownership.
+
+/**
+ * List the current user's category collections plus their included-repo counts.
+ * Stable slugs identify categories; locale selects the taxonomy's display name
+ * and description without renaming the persisted Collection rows.
+ */
+export async function listCategoryCollections(
+  locale?: string
+): Promise<CategoryCollectionSummary[]> {
+  const session = await auth()
+  if (!session?.user?.id) throw new Error("Not authenticated")
+  const { ensureCategoryCollections } = await import("@/lib/classification/service")
+  await ensureCategoryCollections(session.user.id)
+  const categories = await listCategoryCollectionsForUser(session.user.id)
+  if (!locale?.toLowerCase().startsWith("en")) return categories
+
+  return categories.map((category) => {
+    const definition = REPO_CATEGORY_BY_SLUG[category.slug]
+    if (!definition) return category
+    return {
+      ...category,
+      name: definition.nameEn,
+      description: definition.descriptionEn,
+    }
+  })
+}
+
+/**
+ * Page through repositories in one category collection, with filters, sorting
+ * and pagination. Ownership of the category and the repositories is enforced
+ * via the session userId.
+ */
+export async function listCategoryRepositories(
+  query: CategoryRepositoryQuery
+): Promise<CategoryRepositoriesResult> {
+  const session = await auth()
+  if (!session?.user?.id) throw new Error("Not authenticated")
+  return listCategoryRepositoriesForUser(session.user.id, query)
+}
+
+/**
+ * Manually include or exclude a repository in a category collection.
+ * The membership row is always written as `source="manual"` (never overwriting
+ * an existing manual decision) so automatic classification cannot override it.
+ */
+export async function setRepositoryCategoryMembership(args: {
+  repositoryId: string
+  slug: string
+  included: boolean
+}): Promise<{ success: true }> {
+  const session = await auth()
+  if (!session?.user?.id) throw new Error("Not authenticated")
+  return setRepositoryCategoryMembershipForUser(session.user.id, args)
 }

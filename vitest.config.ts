@@ -8,7 +8,13 @@ export default defineConfig({
     alias: { "@": path.resolve(__dirname, "src") },
   },
   test: {
-    include: ["tests/unit/**/*.test.ts"],
+    include: [
+      "tests/unit/**/*.test.ts",
+      "tests/collections/**/*.test.ts",
+      "tests/classification/**/*.test.ts",
+      "tests/classification-integration/**/*.test.ts",
+      "workers/**/*.test.ts",
+    ],
     environment: "node",
   },
 })

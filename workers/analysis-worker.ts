@@ -44,6 +44,8 @@ import {
   HEARTBEAT_INTERVAL_MS,
   type ClaimableAnalysis,
 } from "@/services/analysis/leasing.service"
+import { classifyRepository } from "@/lib/classification"
+import { enqueueRepoClassification } from "@/services/intake"
 
 export const POLL_INTERVAL_MS = 5_000
 
@@ -223,6 +225,31 @@ async function processClaimed(analysis: ClaimableAnalysis, ctx: ClaimContext): P
         )
 
         console.log(`[worker] Completed repo_summary for ${repo.fullName}`)
+
+        // On-demand classification after a fresh summary: the summary is part of
+        // the classification content hash, so a new summary should re-evaluate
+        // the repo's categories. This is strictly one-way — repo_summary ->
+        // repo_classification. The repo_classification handler below never
+        // enqueues another task, so the two queues cannot recursively spawn
+        // each other. `force` stays false: Agent A's classifyRepository still
+        // skips when the hash is unchanged, so no duplicate AI work happens if
+        // the summary did not actually alter the classification content.
+        if (ctx.isAlive()) {
+          try {
+            const enqueued = await enqueueRepoClassification(analysis.repositoryId, analysis.userId, {
+              mode: "all",
+              force: false,
+            })
+            console.log(`[worker] Enqueued repo_classification for ${repo.fullName}: ${enqueued.status}`)
+          } catch (error) {
+            // Best-effort: a classification enqueue failure must not fail the
+            // already-completed summary task.
+            console.warn(
+              `[worker] Failed to enqueue repo_classification for ${repo.fullName}:`,
+              (error as Error).message,
+            )
+          }
+        }
         break
       }
 
@@ -274,6 +301,67 @@ async function processClaimed(analysis: ClaimableAnalysis, ctx: ClaimContext): P
         console.log(
           `[worker] Completed asset_extraction for ${repo.owner}/${repo.name}: ${result.extracted} extracted, ${result.skipped} skipped`,
         )
+        break
+      }
+
+      case "repo_classification": {
+        if (!analysis.repositoryId) {
+          throw new Error("Missing repositoryId for repo_classification analysis")
+        }
+
+        const repo = await prisma.repository.findUnique({
+          where: { id: analysis.repositoryId },
+          select: { userId: true },
+        })
+
+        if (!repo) {
+          throw new Error("Repository not found")
+        }
+        // fail-closed: never classify a repo the analysis owner does not own.
+        assertOwnership(repo.userId, analysis.userId, analysis.id)
+
+        // Agent A's classifyRepository() owns the persisted classification
+        // (and the manual/excluded protection) and skips unchanged content via
+        // its content-hash check, so no repeated/duplicate AI work happens
+        // here. It returns a status ("classified" | "unclassified" | "skipped"
+        // | "failed") instead of throwing for classification failures.
+        //
+        // A "failed" outcome is NOT a successful job: it must flow through the
+        // worker's bounded failure/retry path (failAnalysis -> pending until
+        // attempts are exhausted -> terminal failed) so the UI's failed counter
+        // and re-queue semantics see it. Only genuine outcomes complete.
+        const input = (analysis.input as Record<string, unknown>) ?? {}
+        const result = await classifyRepository({
+          userId: analysis.userId,
+          repositoryId: analysis.repositoryId,
+          force: input.force === true,
+        })
+
+        if (result.status === "failed") {
+          throw new Error(result.error || "Repository classification failed")
+        }
+
+        if (!ctx.isAlive()) throw new LeaseLostError()
+
+        const completed = await completeAnalysis({
+          analysisId: analysis.id,
+          workerId: WORKER_ID,
+          status: "completed",
+          result: JSON.parse(
+            JSON.stringify({
+              status: result.status,
+              categorySlugs: result.categorySlugs ?? [],
+              fromCache: result.fromCache ?? false,
+              error: result.error ?? null,
+            }),
+          ),
+          fencingToken: analysis.attempts,
+        })
+        if (!completed) {
+          console.warn(`[worker] Lost lease for ${analysis.id}; classification result not persisted`)
+        }
+
+        console.log(`[worker] Completed repo_classification for ${analysis.repositoryId} (${result.status})`)
         break
       }
 

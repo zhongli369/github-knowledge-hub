@@ -7,12 +7,23 @@ const mocks = vi.hoisted(() => ({
   createOctokit: vi.fn(),
   upsert: vi.fn(),
   findMany: vi.fn(),
+  // Agent D classification trigger delegates feed through syncRepoToDb.
+  findUnique: vi.fn(),
+  repoFindFirst: vi.fn(),
+  analysisFindFirst: vi.fn(),
+  analysisCreate: vi.fn(),
 }))
 
 vi.mock("@/lib/github/client", () => ({ createOctokit: mocks.createOctokit }))
 vi.mock("@/lib/prisma", () => ({
   prisma: {
-    repository: { upsert: mocks.upsert, findMany: mocks.findMany },
+    repository: {
+      upsert: mocks.upsert,
+      findMany: mocks.findMany,
+      findUnique: mocks.findUnique,
+      findFirst: mocks.repoFindFirst,
+    },
+    analysis: { findFirst: mocks.analysisFindFirst, create: mocks.analysisCreate },
   },
 }))
 
@@ -84,6 +95,12 @@ const rawRepoMinimal = {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  // Defaults for the sync classification trigger: unknown rows are treated as
+  // new (enqueue fires); ownership passes; no active classification in flight.
+  mocks.findUnique.mockResolvedValue(null)
+  mocks.repoFindFirst.mockResolvedValue({ id: "db-repo", owner: "o", name: "n", fullName: "o/n" })
+  mocks.analysisFindFirst.mockResolvedValue(null)
+  mocks.analysisCreate.mockResolvedValue({ id: "classification" })
 })
 
 describe("GitHub repo fetch and sync (Octokit mocked)", () => {

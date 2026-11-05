@@ -120,6 +120,22 @@ async function seedLegacyDatabase(database) {
         ('legacy-analysis', 'repo_summary', 'completed', 'legacy-repo', 'legacy-user', ${now}, ${now}),
         ('legacy-running-analysis', 'asset_extraction', 'running', 'legacy-repo', 'legacy-user', ${now}, ${now})
     `
+    await prisma.$executeRaw`
+      INSERT INTO "Collection"
+        ("id", "name", "description", "isPublic", "userId", "createdAt", "updatedAt")
+      VALUES
+        ('legacy-collection', 'Legacy Collection', 'Keep this collection', false, 'legacy-user', ${now}, ${now})
+    `
+    await prisma.$executeRaw`
+      INSERT INTO "KnowledgeAsset"
+        ("id", "title", "assetType", "content", "summary", "tags", "repositoryId", "userId", "createdAt", "updatedAt")
+      VALUES
+        ('legacy-asset', 'Legacy Asset', 'doc', 'Legacy content', 'Legacy summary', ARRAY['legacy'], 'legacy-repo', 'legacy-user', ${now}, ${now})
+    `
+    await prisma.$executeRaw`
+      INSERT INTO "CollectionAsset" ("id", "collectionId", "assetId", "addedAt", "sortOrder")
+      VALUES ('legacy-collection-asset', 'legacy-collection', 'legacy-asset', ${now}, 3)
+    `
   } finally {
     await prisma.$disconnect()
   }
@@ -146,6 +162,18 @@ try {
   legacySchemaPath = path.join(runtimeDir, `legacy-schema-${runId}.prisma`)
   const currentSchema = readFileSync(path.join(root, "prisma", "schema.prisma"), "utf8")
   const legacySchema = currentSchema
+    // Recreate the schema before functional repository categories. The legacy
+    // fixture must not already contain the migration's tables or columns.
+    .replace(/^  repositoryClassifications[^\n]*\r?\n/m, "")
+    .replace(/^  collectionLinks[^\n]*\r?\n/m, "")
+    .replace(/^  classification\s+RepositoryClassification\?\r?\n/m, "")
+    .replace(/^  slug\s+String\?\r?\n/m, "")
+    .replace(/^  kind\s+String[^\n]*\r?\n/m, "")
+    .replace(/^  repositories\s+CollectionRepository\[\]\r?\n/m, "")
+    .replace(/^  @@unique\(\[userId, slug\]\)\r?\n/m, "")
+    .replace(/^  @@index\(\[userId, kind\]\)\r?\n/m, "")
+    .replace(/^model CollectionRepository \{[\s\S]*?^}\r?\n\r?\n/m, "")
+    .replace(/^model RepositoryClassification \{[\s\S]*?^}\r?\n\r?\n/m, "")
     // Recreate the pre-user-isolation identity constraints. The upgrade
     // migration must be rehearsed from the actual old global uniques, not from
     // a database that already has the new compound keys.
@@ -168,6 +196,9 @@ try {
     legacySchema.includes("leaseExpiresAt") ||
     legacySchema.includes("@@index([status, leaseExpiresAt]") ||
     legacySchema.includes("@@unique([userId, githubId]") ||
+    legacySchema.includes("CollectionRepository") ||
+    legacySchema.includes("RepositoryClassification") ||
+    /^  (?:slug|kind)\s/m.test(legacySchema) ||
     !legacySchema.includes("githubId        Int              @unique") ||
     !legacySchema.includes("fullName        String           @unique")
   ) {

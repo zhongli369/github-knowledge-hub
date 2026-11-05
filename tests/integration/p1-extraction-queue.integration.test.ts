@@ -305,9 +305,11 @@ describe("LLM repo summary against the real database", () => {
   }
 
   it("keeps a live direct analysis leased, clears its lease on completion, and serves cache", async () => {
-    // Remove queue rows left by the preceding enqueue tests so only this direct
-    // analysis is claimable by the recovery worker.
-    await prisma.analysis.deleteMany({ where: { userId: "p1x-user" } })
+    // Remove queue rows left by the preceding enqueue and sync-trigger tests so
+    // only this direct analysis is claimable by the recovery worker.
+    await prisma.analysis.deleteMany({
+      where: { userId: { in: ["p1x-user", "p1x-sync-a", "p1x-sync-b"] } },
+    })
     const deferred = deferredSummaryCompletion()
     mocks.openaiCreate.mockReturnValue(deferred.promise)
 
@@ -352,7 +354,7 @@ describe("LLM repo summary against the real database", () => {
 
   it("recovers an expired direct lease without letting the stale request overwrite it", async () => {
     await prisma.analysis.deleteMany({
-      where: { repositoryId: "p1x-repo-2", userId: "p1x-user" },
+      where: { userId: { in: ["p1x-user", "p1x-sync-a", "p1x-sync-b"] } },
     })
     const deferred = deferredSummaryCompletion()
     mocks.openaiCreate.mockReturnValue(deferred.promise)

@@ -2,6 +2,7 @@
 
 import { auth } from "@/auth"
 import { prisma } from "@/lib/prisma"
+import { enqueueRepoClassification } from "@/services/intake"
 import { fetchRepoReadme } from "@/services/github"
 import {
   analyzeRepoSummary,
@@ -20,6 +21,32 @@ export interface AnalysisActionResult {
   meta: AnalysisMeta | null
   error: string | null
   errorCode: AnalysisErrorCode | null
+}
+
+/**
+ * Best-effort on-demand classification enqueue after a fresh repo_summary.
+ *
+ * A failed enqueue must never turn a successful summary into a failure (the
+ * summary was already persisted by the analysis service), and the
+ * repo_classification queue never re-triggers a summary, so there is no
+ * recursion. Cached summaries mean the content did not change, so they are
+ * skipped to avoid queue noise entirely.
+ */
+async function enqueueClassificationIfNeeded(
+  repoId: string,
+  userId: string,
+  repoName: string,
+  cached: boolean
+): Promise<void> {
+  if (cached) return
+  try {
+    await enqueueRepoClassification(repoId, userId, { mode: "all", force: false })
+  } catch (error) {
+    console.warn(
+      `[actions] Failed to enqueue classification for ${repoName}:`,
+      (error as Error).message,
+    )
+  }
 }
 
 async function getRepoMeta(userId: string, repoId: string) {
@@ -96,6 +123,9 @@ export async function analyzeRepositoryAction(
       readme
     )
 
+    // Best-effort on-demand classification after a freshly generated summary.
+    await enqueueClassificationIfNeeded(repoId, session.user.id, repo.name, result.cached)
+
     const meta = await getRepoAnalysisStatus(repoId, session.user.id)
     return { summary: result.summary, meta, error: null, errorCode: null }
   } catch (error) {
@@ -141,6 +171,9 @@ export async function retryAnalysisAction(
       },
       readme
     )
+
+    // Best-effort on-demand classification after a successful retry.
+    await enqueueClassificationIfNeeded(repoId, session.user.id, repo.name, result.cached)
 
     const meta = await getRepoAnalysisStatus(repoId, session.user.id)
     return { summary: result.summary, meta, error: null, errorCode: null }

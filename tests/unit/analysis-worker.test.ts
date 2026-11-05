@@ -15,14 +15,24 @@ const githubMocks = vi.hoisted(() => ({
   analyze: vi.fn(),
   extract: vi.fn(),
   createOctokit: vi.fn(),
+  classifyRepository: vi.fn(),
+  // Agent D classification trigger delegates.
+  repoFindFirst: vi.fn(),
+  analysisFindFirst: vi.fn(),
+  analysisCreate: vi.fn(),
 }))
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
-    repository: { findUnique: githubMocks.findUnique },
+    repository: {
+      findUnique: githubMocks.findUnique,
+      findFirst: githubMocks.repoFindFirst,
+    },
+    analysis: { findFirst: githubMocks.analysisFindFirst, create: githubMocks.analysisCreate },
     $disconnect: githubMocks.disconnect,
   },
 }))
+vi.mock("@/lib/classification", () => ({ classifyRepository: githubMocks.classifyRepository }))
 vi.mock("@/services/llm/analysis.service", () => ({
   analyzeRepoSummary: githubMocks.analyze,
   AnalysisError: class AnalysisError extends Error {
@@ -56,6 +66,11 @@ beforeEach(() => {
   leasingMocks.completeAnalysis.mockResolvedValue(true)
   leasingMocks.failAnalysis.mockResolvedValue(true)
   leasingMocks.renewLease.mockResolvedValue(true)
+  // Defaults so the repo_summary -> repo_classification trigger can enqueue.
+  githubMocks.repoFindFirst.mockResolvedValue({ id: "repo-1", owner: "o", name: "n", fullName: "o/n" })
+  githubMocks.analysisFindFirst.mockResolvedValue(null)
+  githubMocks.analysisCreate.mockResolvedValue({ id: "classification" })
+  githubMocks.classifyRepository.mockResolvedValue({ status: "classified", categorySlugs: [], fromCache: false })
 })
 
 afterEach(() => {

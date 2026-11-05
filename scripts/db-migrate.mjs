@@ -10,6 +10,7 @@ const initialMigration = "20261103230000_init"
 const searchMigration = "20261103231000_repository_search_vector"
 const workerLeasingMigration = "20261104101530_analysis_worker_leasing"
 const repositoryIsolationMigration = "20261104190000_repository_user_isolation"
+const repositoryCategoriesMigration = "20261105120000_repository_function_categories"
 const prismaCli = path.join(root, "node_modules", "prisma", "build", "index.js")
 
 if (!process.env.DATABASE_URL && existsSync(path.join(root, ".env"))) {
@@ -112,16 +113,40 @@ async function verifyMigratedSchema(prisma) {
     throw new Error("Analysis active-task partial unique index is missing")
   }
 
+  const categoryColumns = await prisma.$queryRawUnsafe(`
+    SELECT column_name FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'Collection'
+      AND column_name IN ('kind', 'slug')
+  `)
+  if (categoryColumns.length !== 2) {
+    throw new Error("Collection functional-category columns are missing")
+  }
+
+  const categoryIndexes = await prisma.$queryRawUnsafe(`
+    SELECT indexname FROM pg_indexes
+    WHERE schemaname = 'public' AND indexname IN (
+      'Collection_userId_kind_idx',
+      'Collection_userId_slug_key',
+      'CollectionRepository_collectionId_excluded_idx',
+      'CollectionRepository_repositoryId_excluded_idx',
+      'CollectionRepository_collectionId_repositoryId_key',
+      'RepositoryClassification_userId_status_idx'
+    )
+  `)
+  if (categoryIndexes.length !== 6) {
+    throw new Error("Repository functional-category indexes are missing")
+  }
+
   const migrations = await prisma.$queryRawUnsafe(`
     SELECT migration_name, finished_at, rolled_back_at
     FROM "_prisma_migrations"
-    WHERE migration_name IN ($1, $2, $3, $4)
-  `, initialMigration, searchMigration, workerLeasingMigration, repositoryIsolationMigration)
+    WHERE migration_name IN ($1, $2, $3, $4, $5)
+  `, initialMigration, searchMigration, workerLeasingMigration, repositoryIsolationMigration, repositoryCategoriesMigration)
   if (
-    migrations.length !== 4 ||
+    migrations.length !== 5 ||
     migrations.some((migration) => !migration.finished_at || migration.rolled_back_at)
   ) {
-    throw new Error("Prisma migration history does not contain all four successful migrations")
+    throw new Error("Prisma migration history does not contain all five successful migrations")
   }
 }
 
@@ -170,8 +195,61 @@ async function assertBaselineEligible(prisma) {
     'ADD COLUMN     "leaseExpiresAt" TIMESTAMP(3),',
     'ADD COLUMN     "workerId" TEXT;',
     "",
+    "-- AlterTable",
+    'ALTER TABLE "Collection" ADD COLUMN     "kind" TEXT NOT NULL DEFAULT \'custom\',',
+    'ADD COLUMN     "slug" TEXT;',
+    "",
+    "-- CreateTable",
+    'CREATE TABLE "CollectionRepository" (',
+    '    "id" TEXT NOT NULL,',
+    '    "collectionId" TEXT NOT NULL,',
+    '    "repositoryId" TEXT NOT NULL,',
+    '    "source" TEXT NOT NULL DEFAULT \'auto\',',
+    '    "excluded" BOOLEAN NOT NULL DEFAULT false,',
+    '    "confidence" DOUBLE PRECISION,',
+    '    "reason" TEXT,',
+    '    "addedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,',
+    '    "updatedAt" TIMESTAMP(3) NOT NULL,',
+    "",
+    '    CONSTRAINT "CollectionRepository_pkey" PRIMARY KEY ("id")',
+    ');',
+    "",
+    "-- CreateTable",
+    'CREATE TABLE "RepositoryClassification" (',
+    '    "repositoryId" TEXT NOT NULL,',
+    '    "userId" TEXT NOT NULL,',
+    '    "contentHash" TEXT NOT NULL,',
+    '    "classifierVersion" TEXT NOT NULL,',
+    '    "status" TEXT NOT NULL,',
+    '    "categorySlugs" TEXT[] DEFAULT ARRAY[]::TEXT[],',
+    '    "error" TEXT,',
+    '    "classifiedAt" TIMESTAMP(3),',
+    '    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,',
+    '    "updatedAt" TIMESTAMP(3) NOT NULL,',
+    "",
+    '    CONSTRAINT "RepositoryClassification_pkey" PRIMARY KEY ("repositoryId")',
+    ');',
+    "",
+    "-- CreateIndex",
+    'CREATE INDEX "CollectionRepository_collectionId_excluded_idx" ON "CollectionRepository"("collectionId", "excluded");',
+    "",
+    "-- CreateIndex",
+    'CREATE INDEX "CollectionRepository_repositoryId_excluded_idx" ON "CollectionRepository"("repositoryId", "excluded");',
+    "",
+    "-- CreateIndex",
+    'CREATE UNIQUE INDEX "CollectionRepository_collectionId_repositoryId_key" ON "CollectionRepository"("collectionId", "repositoryId");',
+    "",
+    "-- CreateIndex",
+    'CREATE INDEX "RepositoryClassification_userId_status_idx" ON "RepositoryClassification"("userId", "status");',
+    "",
     "-- CreateIndex",
     'CREATE INDEX "Analysis_status_leaseExpiresAt_idx" ON "Analysis"("status", "leaseExpiresAt");',
+    "",
+    "-- CreateIndex",
+    'CREATE INDEX "Collection_userId_kind_idx" ON "Collection"("userId", "kind");',
+    "",
+    "-- CreateIndex",
+    'CREATE UNIQUE INDEX "Collection_userId_slug_key" ON "Collection"("userId", "slug");',
     "",
     "-- CreateIndex",
     'CREATE INDEX "Repository_searchVector_idx" ON "Repository" USING GIN ("searchVector");',
@@ -181,6 +259,18 @@ async function assertBaselineEligible(prisma) {
     "",
     "-- CreateIndex",
     'CREATE UNIQUE INDEX "Repository_userId_fullName_key" ON "Repository"("userId", "fullName");',
+    "",
+    "-- AddForeignKey",
+    'ALTER TABLE "CollectionRepository" ADD CONSTRAINT "CollectionRepository_collectionId_fkey" FOREIGN KEY ("collectionId") REFERENCES "Collection"("id") ON DELETE CASCADE ON UPDATE CASCADE;',
+    "",
+    "-- AddForeignKey",
+    'ALTER TABLE "CollectionRepository" ADD CONSTRAINT "CollectionRepository_repositoryId_fkey" FOREIGN KEY ("repositoryId") REFERENCES "Repository"("id") ON DELETE CASCADE ON UPDATE CASCADE;',
+    "",
+    "-- AddForeignKey",
+    'ALTER TABLE "RepositoryClassification" ADD CONSTRAINT "RepositoryClassification_repositoryId_fkey" FOREIGN KEY ("repositoryId") REFERENCES "Repository"("id") ON DELETE CASCADE ON UPDATE CASCADE;',
+    "",
+    "-- AddForeignKey",
+    'ALTER TABLE "RepositoryClassification" ADD CONSTRAINT "RepositoryClassification_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;',
   ].join("\n")
   if (diff !== expectedLegacyDiff) {
     throw new Error(`Database differs from the legacy schema in unexpected ways; baseline refused.\n${diff}`)
@@ -214,7 +304,7 @@ try {
 
   if (command === "deploy" || execute) {
     await verifyMigratedSchema(prisma)
-    console.log("Verified searchVector, leasing fields, per-user repository keys, active-analysis uniqueness, and all migration history.")
+    console.log("Verified searchVector, leasing fields, per-user repository keys, active-analysis uniqueness, functional-category schema, and all migration history.")
   }
 } finally {
   await prisma.$disconnect()

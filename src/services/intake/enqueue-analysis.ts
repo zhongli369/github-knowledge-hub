@@ -152,3 +152,107 @@ export async function enqueueAssetExtraction(
     throw error
   }
 }
+
+// ── Repository auto-classification (Agent D) ────────────────────
+//
+// Reuses the same Analysis/Worker queue with `analysisType =
+// "repo_classification"`. The worker calls Agent A's `classifyRepository`,
+// which owns the persisted classification and the hash-based "unchanged →
+// skip" behaviour. This module only queues; it never writes classification
+// relations directly, so manual/excluded entries are left to Agent A.
+
+export type ClassificationMode = "all" | "unclassified" | "reclassify"
+
+export interface ClassificationEnqueueOptions {
+  mode?: ClassificationMode
+  force?: boolean
+  /** Groups a manual batch so progress does not accumulate across reruns. */
+  batchId?: string
+}
+
+export interface ClassificationEnqueueResult {
+  analysisId: string
+  /**
+   * "queued" 新建任务；"already_queued" 已有 pending/running 任务；
+   * "skipped"（仅 unclassified 模式）仓库已有 classified 结果；
+   * "error"（不抛出）仓库缺失或不属于该用户。
+   */
+  status: "queued" | "already_queued" | "skipped" | "error"
+  error?: string
+}
+
+/**
+ * Create a pending `repo_classification` analysis for the worker to pick up.
+ *
+ * Security boundary mirrors `enqueueRepoSummary`: an illegal repositoryId
+ * (missing or owned by another user) is never queued.
+ *
+ * Mode semantics:
+ *   * "unclassified" only enqueues repositories that have no `classified`
+ *     RepositoryClassification row. Already-classified repos resolve to
+ *     `skipped`.
+ *   * "all" enqueues unconditionally (deduplicated against active jobs). The
+ *     worker's `classifyRepository` skips when the content hash is unchanged,
+ *     so no duplicate AI work is produced.
+ *   * "reclassify" enqueues with `force: true`.
+ *
+ * Concurrency: the active partial unique index on (repositoryId, userId,
+ * analysisType) for pending/running rows guarantees a single in-flight task
+ * per repository; the pre-check plus P2002 loser-re-query map races to
+ * `already_queued` exactly like the summary/extraction enqueues.
+ */
+export async function enqueueRepoClassification(
+  repoId: string,
+  userId: string,
+  opts: ClassificationEnqueueOptions = {}
+): Promise<ClassificationEnqueueResult> {
+  const mode = opts.mode ?? "all"
+
+  // 0. Ownership gate — refuse to enqueue for an illegal repositoryId.
+  const owned = await getOwnedRepositoryMeta(repoId, userId)
+  if (!owned) {
+    return { analysisId: "", status: "error", error: REPOSITORY_NOT_OWNED_MESSAGE }
+  }
+
+  // 1. "unclassified" mode only targets repositories without a current
+  //    classification. The worker never sees these; they are filtered here.
+  if (mode === "unclassified") {
+    const existing = await prisma.repositoryClassification.findUnique({
+      where: { repositoryId: repoId },
+      select: { status: true },
+    })
+    if (existing?.status === "classified") {
+      return { analysisId: "", status: "skipped" }
+    }
+  }
+
+  // 2. Dedup against an active (pending/running) job for the same repo+user.
+  const queued = await findActiveAnalysis(repoId, userId, "repo_classification")
+  if (queued) return queued
+
+  // 3. Create pending analysis record. Concurrent-duplicate enqueues race
+  //    against the partial unique index; the loser resolves to the winner.
+  try {
+    const analysis = await prisma.analysis.create({
+      data: {
+        analysisType: "repo_classification",
+        status: "pending",
+        input: {
+          mode,
+          force: opts.force ?? false,
+          ...(opts.batchId ? { batchId: opts.batchId } : {}),
+        },
+        repositoryId: repoId,
+        userId,
+      },
+    })
+
+    return { analysisId: analysis.id, status: "queued" }
+  } catch (error) {
+    if (isUniqueViolation(error)) {
+      const winner = await findActiveAnalysis(repoId, userId, "repo_classification")
+      if (winner) return winner
+    }
+    throw error
+  }
+}

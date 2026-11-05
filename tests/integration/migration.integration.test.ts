@@ -63,6 +63,7 @@ describe("Prisma migrations in isolated databases", () => {
         "20261103231000_repository_search_vector",
         "20261104101530_analysis_worker_leasing",
         "20261104190000_repository_user_isolation",
+        "20261105120000_repository_function_categories",
       ])
 
       const generated = await prisma.$queryRawUnsafe<Array<{ attgenerated: string; expression: string }>>(`
@@ -105,6 +106,28 @@ describe("Prisma migrations in isolated databases", () => {
       WHERE "searchVector" @@ websearch_to_tsquery('english', 'PostgreSQL')
     `)
     expect(matches).toEqual([{ id: "legacy-repo" }])
+  })
+
+  it("preserves legacy custom collections and collection assets", async () => {
+    const collection = await legacy.collection.findUniqueOrThrow({
+      where: { id: "legacy-collection" },
+      include: { assets: { include: { asset: true } } },
+    })
+    expect(collection).toMatchObject({
+      name: "Legacy Collection",
+      description: "Keep this collection",
+      kind: "custom",
+      slug: null,
+      userId: "legacy-user",
+    })
+    expect(collection.assets).toHaveLength(1)
+    expect(collection.assets[0]).toMatchObject({ sortOrder: 3 })
+    expect(collection.assets[0].asset).toMatchObject({
+      id: "legacy-asset",
+      content: "Legacy content",
+      summary: "Legacy summary",
+      userId: "legacy-user",
+    })
   })
 
   it("makes pre-existing running analyses recoverable by the new worker", async () => {

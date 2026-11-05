@@ -506,7 +506,7 @@ export async function retryFailedAnalysis(
     defaultBranch: string
   },
   readme: string | null
-): Promise<{ summary: RepoSummary }> {
+): Promise<{ summary: RepoSummary; cached: boolean }> {
   // Only retry if latest is failed
   const latest = await prisma.analysis.findFirst({
     where: { repositoryId: repoId, userId, analysisType: "repo_summary" },
