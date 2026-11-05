@@ -32,9 +32,14 @@
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { prisma } from "@/lib/prisma"
-import { analyzeRepoSummary, AnalysisError } from "@/services/llm/analysis.service"
+import {
+  analyzeRepoSummary,
+  AnalysisError,
+  type RepoSummary,
+} from "@/services/llm/analysis.service"
 import { extractAssetsFromRepo } from "@/services/knowledge/extraction.service"
 import { fetchRepoReadme } from "@/services/github"
+import { createAnalysisContentHash } from "@/services/analysis/content-fingerprint"
 import {
   claimNextAnalysis,
   completeAnalysis,
@@ -155,6 +160,189 @@ function assertOwnership(repoUserId: string, analysisUserId: string, analysisId:
   }
 }
 
+/** Stable repo metadata the summary fingerprint is computed from (no volatile counts). */
+interface SummaryFingerprintMeta {
+  name: string
+  fullName: string
+  description: string | null
+  language: string | null
+  topics: string[]
+  url: string
+  defaultBranch: string
+}
+
+/**
+ * P3 content dedup for *automatic* `repo_summary` tasks.
+ *
+ * Before the LLM is paid for, fingerprint the task inputs (stable metadata +
+ * README) and look for a previously completed summary with the same fingerprint
+ * for this user/repo. On a hit the current task is completed by *reusing* that
+ * result (tokensUsed/durationMs = 0, `cached: true`,
+ * `skippedReason: "content_unchanged"`); the LLM is never called.
+ *
+ * The current task's own fingerprint is first persisted fenced on the running
+ * claim (`id` + `workerId` + `attempts` + running lease), so the value is on
+ * the row when it completes — even when the task later completes through the
+ * normal `analyzeRepoSummary` path.
+ *
+ * Returns `true` when the task was already completed (cached) and no further
+ * processing is allowed; `false` when it should fall through to the normal LLM
+ * path. Manual/legacy tasks never enter here (backward compatible).
+ */
+async function maybeReuseCachedSummary(
+  analysis: ClaimableAnalysis,
+  ctx: ClaimContext,
+  repo: SummaryFingerprintMeta,
+  readme: string | null,
+  ownerSummary: { fullName: string }
+): Promise<boolean> {
+  if (!analysis.repositoryId) return false
+
+  const contentHash = createAnalysisContentHash({
+    metadata: {
+      name: repo.name,
+      fullName: repo.fullName,
+      description: repo.description,
+      language: repo.language,
+      // GitHub returns topics in an unstable order; sort before hashing so a
+      // reordered topic list cannot fabricate a spurious content change.
+      topics: [...repo.topics].sort(),
+      url: repo.url,
+      defaultBranch: repo.defaultBranch,
+    },
+    readme,
+  })
+
+  // Persist this run's fingerprint fenced on the running claim. The WHERE clause
+  // matches ONLY while this worker still owns a valid lease at the same fencing
+  // attempt; when it no longer does (reclaimed/timeout/attempt changed) ZERO rows
+  // are updated and the run must stop BEFORE the LLM is paid for — otherwise we
+  // would find after the call that the task can no longer be completed.
+  const fingerprintWrite = await prisma.analysis.updateMany({
+    where: {
+      id: analysis.id,
+      workerId: WORKER_ID,
+      status: "running",
+      leaseExpiresAt: { gt: new Date() },
+      attempts: analysis.attempts,
+    },
+    data: { contentHash },
+  })
+  if (fingerprintWrite.count !== 1) throw new LeaseLostError()
+
+  if (!ctx.isAlive()) throw new LeaseLostError()
+
+  const cached = await prisma.analysis.findFirst({
+    where: {
+      repositoryId: analysis.repositoryId,
+      userId: analysis.userId,
+      analysisType: "repo_summary",
+      status: "completed",
+      contentHash,
+      NOT: { id: analysis.id },
+    },
+    orderBy: { createdAt: "desc" },
+    select: { id: true, result: true, model: true },
+  })
+
+  const cachedResult = (cached?.result as Record<string, unknown> | null) ?? null
+  const summary = (cachedResult?.summary as RepoSummary | undefined) ?? null
+  if (!cached || !summary) return false
+
+  if (!ctx.isAlive()) throw new LeaseLostError()
+
+  const completed = await completeAnalysis({
+    analysisId: analysis.id,
+    workerId: WORKER_ID,
+    status: "completed",
+    result: JSON.parse(
+      JSON.stringify({
+        summary,
+        rawContent: (cachedResult?.rawContent as string | undefined) ?? summary.oneLine,
+        cached: true,
+        skippedReason: "content_unchanged",
+        fromAnalysisId: cached.id,
+      })
+    ),
+    // `completeAnalysis`'s model is a plain string; a legacy cached row may
+    // carry a null model, so only forward it when present.
+    ...(cached.model ? { model: cached.model } : {}),
+    tokensUsed: 0,
+    durationMs: 0,
+    fencingToken: analysis.attempts,
+  })
+  if (!completed) {
+    console.warn(`[worker] Lost lease for ${analysis.id}; cached repo summary result not persisted`)
+  }
+  console.log(
+    `[worker] Reused cached repo_summary for ${ownerSummary.fullName} (content unchanged) — LLM skipped`,
+  )
+  return true
+}
+
+/**
+ * P3 closed loop for a *running* task whose sourceSha went stale while it was
+ * in flight (coordinator Fix 3). Once the old task finishes, this re-checks the
+ * repository head exactly once: if it advanced past the snapshot this task ran
+ * against, the newer snapshot is re-enqueued so it is not lost (the sync no
+ * longer calls us again for unchanged repos). `queueChangedRepositoryAnalysis`
+ * performs its own active/completed dedup, so this can never stack a second
+ * pending row nor recurse — the follow-up only enqueues; it never claims or
+ * executes a task.
+ *
+ * No-op for manual/legacy tasks. Entirely best-effort: a failed follow-up must
+ * never fail an already-completed claim.
+ */
+async function maybeRefollowAfterCompletion(
+  analysis: ClaimableAnalysis,
+  ctx: ClaimContext,
+): Promise<void> {
+  if (!ctx.isAlive()) return
+  const input = (analysis.input as Record<string, unknown> | null) ?? null
+  if (!input || input.automatic !== true) return
+  if (!analysis.repositoryId) return
+
+  try {
+    // Prove (without extending the leasing type) that THIS run's terminal
+    // "completed" state was actually persisted by this fencing token: the row
+    // must be completed carrying the claim-time attempts. A lost-lease / stale
+    // worker (completeAnalysis returned false) finds nothing here and exits, so
+    // it can never enqueue a follow-up side-effect.
+    const completed = await prisma.analysis.findFirst({
+      where: { id: analysis.id, status: "completed", attempts: analysis.attempts },
+      select: { sourceSha: true },
+    })
+    if (!completed) return
+
+    const repo = await prisma.repository.findUnique({
+      where: { id: analysis.repositoryId },
+      select: { headSha: true },
+    })
+    const completedSourceSha = completed.sourceSha ?? null
+    if (!repo?.headSha || repo.headSha === completedSourceSha) return
+
+    const { queueChangedRepositoryAnalysis } = await import(
+      "@/services/analysis/auto-analysis.service"
+    )
+    const outcome = await queueChangedRepositoryAnalysis({
+      repositoryId: analysis.repositoryId,
+      userId: analysis.userId,
+      sourceSha: repo.headSha,
+      reason: "updated",
+    })
+    console.log(
+      `[worker] Follow-up: re-enqueued ${analysis.analysisType} for head ${repo.headSha} ` +
+        `(completed task ran at ${completedSourceSha ?? "null"}) -> queued=${outcome.queued} skipped=${outcome.skipped}`,
+    )
+  } catch (error) {
+    // Never fail a completed claim because the follow-up check failed.
+    console.warn(
+      `[worker] Follow-up re-enqueue skipped for ${analysis.repositoryId}:`,
+      error instanceof Error ? error.message : String(error),
+    )
+  }
+}
+
 /**
  * Process a claimed analysis. `ctx` gates every write; once the claim is dead
  * the function stops launching writes and suppresses any late error it hits.
@@ -196,6 +384,32 @@ async function processClaimed(analysis: ClaimableAnalysis, ctx: ClaimContext): P
         // rethrown by fetchRepoReadme so the task fails (and retries) instead
         // of completing with a silently-missing README.
         const readme = await fetchRepoReadme(analysis.userId, repo.owner, repo.name)
+
+        if (!ctx.isAlive()) throw new LeaseLostError()
+
+        const input = (analysis.input as Record<string, unknown> | null) ?? {}
+        const isAutomatic = input.automatic === true
+
+        // P3: automatic tasks are deduplicated by content fingerprint before the
+        // LLM is paid for. Manual/legacy tasks skip straight to the normal path.
+        if (isAutomatic) {
+          const reused = await maybeReuseCachedSummary(
+            analysis,
+            ctx,
+            {
+              name: repo.name,
+              fullName: repo.fullName,
+              description: repo.description,
+              language: repo.language,
+              topics: repo.topics,
+              url: repo.url,
+              defaultBranch: repo.defaultBranch,
+            },
+            readme,
+            { fullName: repo.fullName },
+          )
+          if (reused) break
+        }
 
         if (!ctx.isAlive()) throw new LeaseLostError()
 
@@ -271,6 +485,7 @@ async function processClaimed(analysis: ClaimableAnalysis, ctx: ClaimContext): P
         assertOwnership(repo.userId, analysis.userId, analysis.id)
 
         const input = (analysis.input as Record<string, unknown>) ?? {}
+        const isAutomatic = input.automatic === true
         const result = await extractAssetsFromRepo(
           analysis.userId,
           analysis.repositoryId,
@@ -279,6 +494,14 @@ async function processClaimed(analysis: ClaimableAnalysis, ctx: ClaimContext): P
           {
             maxFiles: (input.maxFiles as number) ?? 20,
             useLLM: (input.useLLM as boolean) ?? true,
+            // P3: ONLY automatic tasks carry the sourceSha property — the
+            // extraction layer uses its *presence* to recognize the
+            // auto-incremental path (a null value still counts as automatic, so
+            // an empty-repo fingerprint fallback is never treated as manual).
+            // Manual/legacy tasks keep the historical options shape unchanged.
+            ...(isAutomatic
+              ? { sourceSha: typeof input.sourceSha === "string" ? input.sourceSha : null }
+              : {}),
             // Stop the extraction loop on heartbeat loss so a stale worker can
             // not keep writing knowledge assets after losing the lease.
             isCancelled: () => !ctx.isAlive(),
@@ -416,6 +639,7 @@ export async function runClaimed(analysis: ClaimableAnalysis): Promise<boolean> 
       () => ctx.cancel(`task-timeout-${timeoutMs}`),
       () => new TaskTimeoutError(analysis.id, timeoutMs),
     )
+    await maybeRefollowAfterCompletion(analysis, ctx)
     return true
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : "Unknown error"

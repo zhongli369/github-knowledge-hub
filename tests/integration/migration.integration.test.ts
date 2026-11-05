@@ -64,6 +64,7 @@ describe("Prisma migrations in isolated databases", () => {
         "20261104101530_analysis_worker_leasing",
         "20261104190000_repository_user_isolation",
         "20261105120000_repository_function_categories",
+        "20261105120001_p3_auto_sync",
       ])
 
       const generated = await prisma.$queryRawUnsafe<Array<{ attgenerated: string; expression: string }>>(`
@@ -85,6 +86,28 @@ describe("Prisma migrations in isolated databases", () => {
       `)
       expect(index[0]?.indexdef).toContain("USING gin")
     }
+  })
+
+  it("enforces one running sync per user without blocking later runs", async () => {
+    const user = await fresh.user.create({
+      data: { email: "p3-sync-concurrency@example.invalid" },
+    })
+    const first = await fresh.syncRun.create({
+      data: { userId: user.id, trigger: "manual", status: "running" },
+    })
+
+    await expect(fresh.syncRun.create({
+      data: { userId: user.id, trigger: "scheduled", status: "running" },
+    })).rejects.toMatchObject({ code: "P2002" })
+
+    await fresh.syncRun.update({
+      where: { id: first.id },
+      data: { status: "completed", finishedAt: new Date() },
+    })
+    const later = await fresh.syncRun.create({
+      data: { userId: user.id, trigger: "scheduled", status: "running" },
+    })
+    expect(later.userId).toBe(user.id)
   })
 
   it("preserves legacy business records and derives their search text", async () => {

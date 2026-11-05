@@ -35,6 +35,7 @@ export const translations: Record<Locale, Record<string, Record<string, string>>
       assets: "知识资产",
       discover: "语义搜索",
       analyses: "分析历史",
+      automation: "自动化",
     },
     dashboard: {
       title: "欢迎回来",
@@ -362,6 +363,7 @@ export const translations: Record<Locale, Record<string, Record<string, string>>
       assets: "Assets",
       discover: "Discover",
       analyses: "Analyses",
+      automation: "Automation",
     },
     dashboard: {
       title: "Welcome back",

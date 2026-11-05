@@ -1,6 +1,7 @@
 import { prisma } from "@/lib/prisma"
 import { analyzeCodePatterns } from "@/services/llm/analysis.service"
 import { embedKnowledgeAsset } from "@/services/llm/embeddings.service"
+import { createFileContentHash } from "@/services/analysis/content-fingerprint"
 
 // File extension → language mapping will be re-added when Phase 5 is enabled.
 
@@ -48,6 +49,16 @@ export interface ExtractionResult {
   assetType: string
 }
 
+/**
+ * Extra bookkeeping the P3 auto-sync passes down to every created asset so the
+ * extraction layer can persist `sourceSha` / `contentHash` on the asset row.
+ * Both are optional so legacy/manual callers are unaffected.
+ */
+export interface ExtractionAssetFingerprint {
+  sourceSha?: string | null
+  contentHash?: string | null
+}
+
 export interface ParsedCodeAnalysis {
   /** Sanitized JSON summary, or null when the LLM payload is not valid JSON. */
   summary: string | null
@@ -90,7 +101,8 @@ export async function extractFromFile(
   repositoryId: string,
   path: string,
   content: string,
-  language: string
+  language: string,
+  fingerprint?: ExtractionAssetFingerprint
 ): Promise<ExtractionResult | null> {
   const fileName = path.split("/").pop() ?? path
 
@@ -107,6 +119,8 @@ export async function extractFromFile(
         difficulty: null,
         repositoryId,
         userId,
+        sourceSha: fingerprint?.sourceSha ?? null,
+        contentHash: fingerprint?.contentHash ?? null,
       },
     })
 
@@ -137,7 +151,8 @@ export async function extractWithLLM(
   path: string,
   content: string,
   language: string,
-  isCancelled: () => boolean = () => false
+  isCancelled: () => boolean = () => false,
+  fingerprint?: ExtractionAssetFingerprint
 ): Promise<ExtractionResult | null> {
   const fileName = path.split("/").pop() ?? path
 
@@ -171,6 +186,8 @@ export async function extractWithLLM(
         tags: extractTags(path, content),
         repositoryId,
         userId,
+        sourceSha: fingerprint?.sourceSha ?? null,
+        contentHash: fingerprint?.contentHash ?? null,
       },
     })
 
@@ -267,16 +284,34 @@ const EXT_TO_LANG: Record<string, string> = {
  * Ownership is verified first: a user may only write assets into repositories
  * they own, so a caller can never inject assets into another user's repo.
  *
- * Re-runs are idempotent: paths already extracted for this repository are
- * skipped up-front, and the KnowledgeAsset(repositoryId, sourcePath) unique
- * index catches concurrent double-inserts (P2002) as a safety net.
+ * Re-runs are idempotent: the KnowledgeAsset(repositoryId, sourcePath) unique
+ * index catches concurrent double-inserts (P2002), and the worker never stacks
+ * duplicate extractions.
+ *
+ * P3 — automatic incremental sync runs (recognised by the *presence* of a
+ * `sourceSha` property in the options, even when its value is null) additionally:
+ *   * skip unchanged files by comparing the file's SHA-256 with the asset's
+ *     recorded `contentHash` (no LLM, no write);
+ *   * backfill provenance (`sourceSha`/`contentHash`) on legacy assets whose
+ *     stored content is byte-identical;
+ *   * refresh a changed asset *in place* (same id, collections preserved) via
+ *     `updateMany` — new source text and, when LLM-worthy, a fresh summary.
+ *
+ * Manual/legacy callers (no `sourceSha`) keep the original behaviour exactly:
+ * previously-extracted paths are skipped up-front.
  */
 export async function extractAssetsFromRepo(
   userId: string,
   repositoryId: string,
   owner: string,
   repoName: string,
-  options?: { maxFiles?: number; useLLM?: boolean; isCancelled?: () => boolean }
+  options?: {
+    maxFiles?: number
+    useLLM?: boolean
+    isCancelled?: () => boolean
+    /** Git snapshot this extraction was queued for (P3 auto-sync). */
+    sourceSha?: string | null
+  }
 ): Promise<{ extracted: number; skipped: number; embedded: number }> {
   const { fetchRepoFileTree, fetchFileContent } = await import("@/services/github")
 
@@ -292,6 +327,14 @@ export async function extractAssetsFromRepo(
   const maxFiles = options?.maxFiles ?? 20
   const useLLM = options?.useLLM ?? true
   const isCancelled = options?.isCancelled ?? (() => false)
+  const sourceSha = options?.sourceSha ?? null
+  // The P3 worker is the ONLY caller that sets the `sourceSha` property (see
+  // workers/analysis-worker.ts): its *presence* — even with a null value, which
+  // happens for an empty-repo / fingerprint-fallback snapshot — marks this run
+  // as automatic. Manual/legacy callers omit the property entirely and keep the
+  // P1/P2 path-based pre-dedup.
+  const isAutomatic =
+    options !== undefined && Object.prototype.hasOwnProperty.call(options, "sourceSha")
 
   if (isCancelled()) return { extracted: 0, skipped: 0, embedded: 0 }
 
@@ -308,15 +351,49 @@ export async function extractAssetsFromRepo(
     .sort((a, b) => (b.size ?? 0) - (a.size ?? 0))
     .slice(0, maxFiles)
 
-  // Pre-extraction dedup: skip files already extracted for this repo
-  const existingPaths = new Set(
-    (await prisma.knowledgeAsset.findMany({
-      where: { repositoryId },
-      select: { sourcePath: true },
-    }))
-      .map((a) => a.sourcePath)
-      .filter(Boolean) as string[]
-  )
+  // Pre-extraction dedup state.
+  //
+  // * `existingByPath` maps sourcePath → the previously-created asset for this
+  //   repository (id + optional contentHash + optional stored content).
+  // * A `contentHash` of null marks a *legacy* (pre-P3) asset whose fingerprint
+  //   was never recorded; it never re-fetches on the manual path.
+  // * `isAutomatic` is derived from an explicit `sourceSha` in the options (the
+  //   GitHub sync always passes one). Manual/legacy callers omit it and keep
+  //   the historical path-based behaviour.
+  const existingByPath = new Map<string, { id: string; contentHash: string | null; storedContent: string | null }>()
+  const priorAssets = await prisma.knowledgeAsset.findMany({
+    where: { repositoryId },
+    select: { id: true, sourcePath: true, contentHash: true },
+  })
+  for (const asset of priorAssets) {
+    if (!asset.sourcePath || existingByPath.has(asset.sourcePath)) continue
+    existingByPath.set(asset.sourcePath, {
+      id: asset.id,
+      contentHash: asset.contentHash ?? null,
+      storedContent: null,
+    })
+  }
+
+  // Automatic runs can compute the "old" fingerprint of a legacy asset from the
+  // content the asset already stores, so a byte-identical legacy file is
+  // backfilled with provenance instead of being re-analyzed. Fetch that content
+  // once, only for the legacy paths actually present in this repository.
+  if (isAutomatic) {
+    const legacyPaths = Array.from(existingByPath.entries())
+      .filter(([, prior]) => prior.contentHash == null)
+      .map(([sourcePath]) => sourcePath)
+    if (legacyPaths.length > 0) {
+      const legacyRows = await prisma.knowledgeAsset.findMany({
+        where: { repositoryId, sourcePath: { in: legacyPaths }, contentHash: null },
+        select: { sourcePath: true, content: true },
+      })
+      for (const row of legacyRows) {
+        if (!row.sourcePath) continue
+        const prior = existingByPath.get(row.sourcePath)
+        if (prior) prior.storedContent = row.content ?? null
+      }
+    }
+  }
 
   let extracted = 0
   let skipped = 0
@@ -324,41 +401,165 @@ export async function extractAssetsFromRepo(
 
   for (const file of files) {
     if (isCancelled()) break
-    if (existingPaths.has(file.path)) {
+
+    const prior = existingByPath.get(file.path)
+    const prevHash = prior?.contentHash ?? null
+
+    // Manual/legacy runs (no sourceSha) keep the P1/P2 pre-dedup: any prior
+    // asset for this path is left untouched (no fetch, no LLM, no write).
+    if (!isAutomatic && prior) {
       skipped++
       continue
     }
+
+    let content: string | null
     try {
-      const content = await fetchFileContent(userId, owner, repoName, file.path)
-      if (isCancelled()) break
-      if (!content || content.length < 50) {
-        skipped++
-        continue
-      }
-
-      if (useLLM) {
-        if (!isInterestingFile(content)) {
-          skipped++
-          continue
-        }
-        const result = await extractWithLLM(userId, repositoryId, file.path, content, file.lang, isCancelled)
-        if (result) extracted++
-        else skipped++
-      } else {
-        const result = await extractFromFile(userId, repositoryId, file.path, content, file.lang)
-        if (result) extracted++
-        else skipped++
-      }
-
-      // Embedding is best-effort inside extractFromFile/extractWithLLM
-      embedded = extracted
+      content = await fetchFileContent(userId, owner, repoName, file.path)
     } catch (error) {
       if (isCancelled()) break
       // Rate limits, permission failures and other upstream errors must fail the
       // Analysis so the worker can retry; they are not ordinary file skips.
       throw error
     }
+    if (isCancelled()) break
+    if (!content || content.length < 50) {
+      skipped++
+      continue
+    }
+
+    const contentHash = createFileContentHash(content)
+
+    // ── Brand-new path: extract a fresh knowledge asset ──
+    if (!prior) {
+      if (useLLM) {
+        if (!isInterestingFile(content)) {
+          skipped++
+          continue
+        }
+        const result = await extractWithLLM(
+          userId,
+          repositoryId,
+          file.path,
+          content,
+          file.lang,
+          isCancelled,
+          { sourceSha, contentHash },
+        )
+        if (result) {
+          extracted++
+          existingByPath.set(file.path, {
+            id: result.assetId,
+            contentHash,
+            storedContent: content.slice(0, 50000),
+          })
+        } else {
+          skipped++
+        }
+      } else {
+        const result = await extractFromFile(userId, repositoryId, file.path, content, file.lang, {
+          sourceSha,
+          contentHash,
+        })
+        if (result) {
+          extracted++
+          existingByPath.set(file.path, {
+            id: result.assetId,
+            contentHash,
+            storedContent: content.slice(0, 50000),
+          })
+        } else {
+          skipped++
+        }
+      }
+      continue
+    }
+
+    // ── An asset already exists for this sourcePath (automatic runs only) ──
+
+    // The same (repositoryId, sourcePath) already holds a knowledge asset whose
+    // content hash is identical: content is unchanged — skip the LLM call (and
+    // any write) entirely. This is the P3 auto-sync dedup core.
+    if (prevHash !== null && prevHash === contentHash) {
+      skipped++
+      continue
+    }
+
+    // Legacy provenance backfill: a legacy asset (contentHash null) whose stored
+    // content is byte-identical to the current file only needs sourceSha /
+    // contentHash recorded — its summary and content stay untouched.
+    const oldHash = prior.storedContent ? createFileContentHash(prior.storedContent) : null
+    if (prevHash === null && oldHash === contentHash) {
+      const updated = await prisma.knowledgeAsset.updateMany({
+        where: { id: prior.id, repositoryId, sourcePath: file.path, contentHash: null },
+        data: { sourceSha, contentHash },
+      })
+      if (updated.count > 0) {
+        existingByPath.set(file.path, { id: prior.id, contentHash, storedContent: prior.storedContent })
+      }
+      skipped++
+      continue
+    }
+
+    // Content changed (or a legacy stored content differs / is unavailable):
+    // refresh the EXISTING asset in place — same id, collections preserved —
+    // with the new source text and, when the file is LLM-worthy, a fresh
+    // summary. Fenced on the old contentHash so a concurrent refresh of the same
+    // row loses this update instead of clobbering a newer result.
+    let freshSummary: string | null
+    let freshDifficulty: AssetDifficulty | null = null
+    if (useLLM && isInterestingFile(content)) {
+      const analysis = await analyzeCodePatterns({
+        userId,
+        repositoryId,
+        content,
+        fileName: file.path.split("/").pop() ?? file.path,
+        language: file.lang,
+      })
+      if (isCancelled()) break
+      const parsed = parseCodeAnalysisResult(analysis)
+      freshSummary = parsed.summary
+      freshDifficulty = parsed.difficulty
+    } else {
+      // Not LLM-worthy (or plain extraction): sync content + provenance and
+      // clear any stale summary/difficulty — an old description pasted over the
+      // new content would be misleading.
+      freshSummary = null
+    }
+
+    const updated = await prisma.knowledgeAsset.updateMany({
+      where: { id: prior.id, repositoryId, sourcePath: file.path, contentHash: prevHash },
+      data: {
+        content: content.slice(0, 50000),
+        description: `${file.lang} file from repository`,
+        assetType: detectAssetType(file.path, content),
+        language: file.lang,
+        tags: extractTags(file.path, content),
+        summary: freshSummary,
+        difficulty: freshSummary !== null ? freshDifficulty : null,
+        sourceSha,
+        contentHash,
+      },
+    })
+    if (updated.count === 0) {
+      // A concurrent run refreshed the row between our fetch and this update
+      // (the WHERE clause no longer matches). Count as already handled.
+      skipped++
+      continue
+    }
+    existingByPath.set(file.path, { id: prior.id, contentHash, storedContent: content.slice(0, 50000) })
+    extracted++
+
+    // Best-effort re-embed under the new summary / content.
+    const embedText = freshSummary ? `${file.path.split("/").pop() ?? ""}\n${freshSummary}` : content
+    try {
+      await embedKnowledgeAsset(prior.id, embedText.slice(0, 8000))
+    } catch {
+      // best-effort — a refresh must not fail because embedding is down
+    }
   }
+
+  // Embedding is best-effort inside extractFromFile/extractWithLLM/refresh.
+  embedded = extracted
 
   return { extracted, skipped, embedded }
 }

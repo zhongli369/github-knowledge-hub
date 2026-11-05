@@ -26,8 +26,12 @@ function isUniqueViolation(error: unknown): boolean {
  * Look up an active (pending / running) analysis of the given type for this
  * repository + user. Used by the pre-insert dedup and by the concurrent-winner
  * re-query after a unique-violation, so a loser maps to `already_queued`.
+ *
+ * Exported for the P3 auto-analysis enqueue path, which reuses the exact same
+ * active-task dedup so automatic tasks never stack a second pending row on top
+ * of a manual one (and vice versa).
  */
-async function findActiveAnalysis(
+export async function findActiveAnalysis(
   repoId: string,
   userId: string,
   analysisType: string

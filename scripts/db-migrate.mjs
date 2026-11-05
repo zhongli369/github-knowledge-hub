@@ -11,6 +11,7 @@ const searchMigration = "20261103231000_repository_search_vector"
 const workerLeasingMigration = "20261104101530_analysis_worker_leasing"
 const repositoryIsolationMigration = "20261104190000_repository_user_isolation"
 const repositoryCategoriesMigration = "20261105120000_repository_function_categories"
+const autoSyncMigration = "20261105120001_p3_auto_sync"
 const prismaCli = path.join(root, "node_modules", "prisma", "build", "index.js")
 
 if (!process.env.DATABASE_URL && existsSync(path.join(root, ".env"))) {
@@ -113,7 +114,7 @@ async function verifyMigratedSchema(prisma) {
     throw new Error("Analysis active-task partial unique index is missing")
   }
 
-  const categoryColumns = await prisma.$queryRawUnsafe(`
+const categoryColumns = await prisma.$queryRawUnsafe(`
     SELECT column_name FROM information_schema.columns
     WHERE table_schema = 'public' AND table_name = 'Collection'
       AND column_name IN ('kind', 'slug')
@@ -137,16 +138,29 @@ async function verifyMigratedSchema(prisma) {
     throw new Error("Repository functional-category indexes are missing")
   }
 
+  const runningSyncIndexes = await prisma.$queryRawUnsafe(`
+    SELECT indexdef FROM pg_indexes
+    WHERE schemaname = 'public' AND tablename = 'SyncRun'
+      AND indexname = 'SyncRun_userId_running_key'
+  `)
+  if (
+    runningSyncIndexes.length !== 1 ||
+    !runningSyncIndexes[0].indexdef.includes("UNIQUE INDEX") ||
+    !runningSyncIndexes[0].indexdef.includes("WHERE")
+  ) {
+    throw new Error("SyncRun per-user running-task partial unique index is missing")
+  }
+
   const migrations = await prisma.$queryRawUnsafe(`
     SELECT migration_name, finished_at, rolled_back_at
     FROM "_prisma_migrations"
-    WHERE migration_name IN ($1, $2, $3, $4, $5)
-  `, initialMigration, searchMigration, workerLeasingMigration, repositoryIsolationMigration, repositoryCategoriesMigration)
+    WHERE migration_name IN ($1, $2, $3, $4, $5, $6)
+  `, initialMigration, searchMigration, workerLeasingMigration, repositoryIsolationMigration, repositoryCategoriesMigration, autoSyncMigration)
   if (
-    migrations.length !== 5 ||
+    migrations.length !== 6 ||
     migrations.some((migration) => !migration.finished_at || migration.rolled_back_at)
   ) {
-    throw new Error("Prisma migration history does not contain all five successful migrations")
+    throw new Error("Prisma migration history does not contain all six successful migrations")
   }
 }
 
@@ -183,23 +197,35 @@ async function assertBaselineEligible(prisma) {
     "--script",
   ], true).replaceAll("\r\n", "\n").trim()
   const expectedLegacyDiff = [
-    "-- DropIndex",
+    '-- DropIndex',
     'DROP INDEX "Repository_fullName_key";',
     "",
-    "-- DropIndex",
+    '-- DropIndex',
     'DROP INDEX "Repository_githubId_key";',
     "",
-    "-- AlterTable",
+    '-- AlterTable',
     'ALTER TABLE "Analysis" ADD COLUMN     "attempts" INTEGER NOT NULL DEFAULT 0,',
     'ADD COLUMN     "claimedAt" TIMESTAMP(3),',
+    'ADD COLUMN     "contentHash" TEXT,',
     'ADD COLUMN     "leaseExpiresAt" TIMESTAMP(3),',
+    'ADD COLUMN     "sourceSha" TEXT,',
     'ADD COLUMN     "workerId" TEXT;',
     "",
-    "-- AlterTable",
+    '-- AlterTable',
     'ALTER TABLE "Collection" ADD COLUMN     "kind" TEXT NOT NULL DEFAULT \'custom\',',
     'ADD COLUMN     "slug" TEXT;',
     "",
-    "-- CreateTable",
+    '-- AlterTable',
+    'ALTER TABLE "KnowledgeAsset" ADD COLUMN     "contentHash" TEXT,',
+    'ADD COLUMN     "sourceSha" TEXT;',
+    "",
+    '-- AlterTable',
+    'ALTER TABLE "Repository" ADD COLUMN     "headSha" TEXT,',
+    'ADD COLUMN     "starredAt" TIMESTAMP(3),',
+    'ADD COLUMN     "syncHash" TEXT,',
+    'ADD COLUMN     "unstarredAt" TIMESTAMP(3);',
+    "",
+    '-- CreateTable',
     'CREATE TABLE "CollectionRepository" (',
     '    "id" TEXT NOT NULL,',
     '    "collectionId" TEXT NOT NULL,',
@@ -214,7 +240,7 @@ async function assertBaselineEligible(prisma) {
     '    CONSTRAINT "CollectionRepository_pkey" PRIMARY KEY ("id")',
     ');',
     "",
-    "-- CreateTable",
+    '-- CreateTable',
     'CREATE TABLE "RepositoryClassification" (',
     '    "repositoryId" TEXT NOT NULL,',
     '    "userId" TEXT NOT NULL,',
@@ -230,48 +256,107 @@ async function assertBaselineEligible(prisma) {
     '    CONSTRAINT "RepositoryClassification_pkey" PRIMARY KEY ("repositoryId")',
     ');',
     "",
-    "-- CreateIndex",
+    '-- CreateTable',
+    'CREATE TABLE "AutomationSettings" (',
+    '    "id" TEXT NOT NULL,',
+    '    "userId" TEXT NOT NULL,',
+    '    "enabled" BOOLEAN NOT NULL DEFAULT false,',
+    '    "autoAnalyze" BOOLEAN NOT NULL DEFAULT true,',
+    '    "intervalMinutes" INTEGER NOT NULL DEFAULT 60,',
+    '    "nextSyncAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,',
+    '    "leaseExpiresAt" TIMESTAMP(3),',
+    '    "workerId" TEXT,',
+    '    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,',
+    '    "updatedAt" TIMESTAMP(3) NOT NULL,',
+    "",
+    '    CONSTRAINT "AutomationSettings_pkey" PRIMARY KEY ("id")',
+    ');',
+    "",
+    '-- CreateTable',
+    'CREATE TABLE "SyncRun" (',
+    '    "id" TEXT NOT NULL,',
+    '    "userId" TEXT NOT NULL,',
+    '    "trigger" TEXT NOT NULL,',
+    '    "status" TEXT NOT NULL,',
+    '    "totalCount" INTEGER NOT NULL DEFAULT 0,',
+    '    "processedCount" INTEGER NOT NULL DEFAULT 0,',
+    '    "addedCount" INTEGER NOT NULL DEFAULT 0,',
+    '    "updatedCount" INTEGER NOT NULL DEFAULT 0,',
+    '    "unchangedCount" INTEGER NOT NULL DEFAULT 0,',
+    '    "unstarredCount" INTEGER NOT NULL DEFAULT 0,',
+    '    "failedCount" INTEGER NOT NULL DEFAULT 0,',
+    '    "analysisQueuedCount" INTEGER NOT NULL DEFAULT 0,',
+    '    "error" TEXT,',
+    '    "startedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,',
+    '    "finishedAt" TIMESTAMP(3),',
+    '    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,',
+    '    "updatedAt" TIMESTAMP(3) NOT NULL,',
+    "",
+    '    CONSTRAINT "SyncRun_pkey" PRIMARY KEY ("id")',
+    ');',
+    "",
+    '-- CreateIndex',
     'CREATE INDEX "CollectionRepository_collectionId_excluded_idx" ON "CollectionRepository"("collectionId", "excluded");',
     "",
-    "-- CreateIndex",
+    '-- CreateIndex',
     'CREATE INDEX "CollectionRepository_repositoryId_excluded_idx" ON "CollectionRepository"("repositoryId", "excluded");',
     "",
-    "-- CreateIndex",
+    '-- CreateIndex',
     'CREATE UNIQUE INDEX "CollectionRepository_collectionId_repositoryId_key" ON "CollectionRepository"("collectionId", "repositoryId");',
     "",
-    "-- CreateIndex",
+    '-- CreateIndex',
     'CREATE INDEX "RepositoryClassification_userId_status_idx" ON "RepositoryClassification"("userId", "status");',
     "",
-    "-- CreateIndex",
+    '-- CreateIndex',
+    'CREATE UNIQUE INDEX "AutomationSettings_userId_key" ON "AutomationSettings"("userId");',
+    "",
+    '-- CreateIndex',
+    'CREATE INDEX "AutomationSettings_enabled_nextSyncAt_idx" ON "AutomationSettings"("enabled", "nextSyncAt");',
+    "",
+    '-- CreateIndex',
+    'CREATE INDEX "SyncRun_userId_createdAt_idx" ON "SyncRun"("userId", "createdAt");',
+    "",
+    '-- CreateIndex',
+    'CREATE INDEX "SyncRun_status_idx" ON "SyncRun"("status");',
+    "",
+    '-- CreateIndex',
     'CREATE INDEX "Analysis_status_leaseExpiresAt_idx" ON "Analysis"("status", "leaseExpiresAt");',
     "",
-    "-- CreateIndex",
+    '-- CreateIndex',
     'CREATE INDEX "Collection_userId_kind_idx" ON "Collection"("userId", "kind");',
     "",
-    "-- CreateIndex",
+    '-- CreateIndex',
     'CREATE UNIQUE INDEX "Collection_userId_slug_key" ON "Collection"("userId", "slug");',
     "",
-    "-- CreateIndex",
+    '-- CreateIndex',
     'CREATE INDEX "Repository_searchVector_idx" ON "Repository" USING GIN ("searchVector");',
     "",
-    "-- CreateIndex",
+    '-- CreateIndex',
     'CREATE UNIQUE INDEX "Repository_userId_githubId_key" ON "Repository"("userId", "githubId");',
     "",
-    "-- CreateIndex",
+    '-- CreateIndex',
     'CREATE UNIQUE INDEX "Repository_userId_fullName_key" ON "Repository"("userId", "fullName");',
     "",
-    "-- AddForeignKey",
+    '-- AddForeignKey',
     'ALTER TABLE "CollectionRepository" ADD CONSTRAINT "CollectionRepository_collectionId_fkey" FOREIGN KEY ("collectionId") REFERENCES "Collection"("id") ON DELETE CASCADE ON UPDATE CASCADE;',
     "",
-    "-- AddForeignKey",
+    '-- AddForeignKey',
     'ALTER TABLE "CollectionRepository" ADD CONSTRAINT "CollectionRepository_repositoryId_fkey" FOREIGN KEY ("repositoryId") REFERENCES "Repository"("id") ON DELETE CASCADE ON UPDATE CASCADE;',
     "",
-    "-- AddForeignKey",
+    '-- AddForeignKey',
     'ALTER TABLE "RepositoryClassification" ADD CONSTRAINT "RepositoryClassification_repositoryId_fkey" FOREIGN KEY ("repositoryId") REFERENCES "Repository"("id") ON DELETE CASCADE ON UPDATE CASCADE;',
     "",
-    "-- AddForeignKey",
+    '-- AddForeignKey',
     'ALTER TABLE "RepositoryClassification" ADD CONSTRAINT "RepositoryClassification_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;',
+    "",
+    '-- AddForeignKey',
+    'ALTER TABLE "AutomationSettings" ADD CONSTRAINT "AutomationSettings_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;',
+    "",
+    '-- AddForeignKey',
+    'ALTER TABLE "SyncRun" ADD CONSTRAINT "SyncRun_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;',
   ].join("\n")
+
+
   if (diff !== expectedLegacyDiff) {
     throw new Error(`Database differs from the legacy schema in unexpected ways; baseline refused.\n${diff}`)
   }
@@ -304,7 +389,7 @@ try {
 
   if (command === "deploy" || execute) {
     await verifyMigratedSchema(prisma)
-    console.log("Verified searchVector, leasing fields, per-user repository keys, active-analysis uniqueness, functional-category schema, and all migration history.")
+    console.log("Verified searchVector, leasing fields, per-user repository keys, active-analysis uniqueness, functional-category schema, auto-sync schema, and all migration history.")
   }
 } finally {
   await prisma.$disconnect()

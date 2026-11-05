@@ -3,9 +3,9 @@
   GitHub Knowledge Hub — reliable Windows desktop launcher.
 .DESCRIPTION
   Starts PostgreSQL, validates migration state without changing schema, then
-  starts Next.js and the analysis worker with separate PID files and logs.
+  starts Next.js and both workers with separate PID files and logs.
 .PARAMETER SmokeTest
-  Verify both processes and stop only the processes started by this invocation.
+  Verify all three processes and stop only the processes started by this invocation.
 #>
 [CmdletBinding()]
 param(
@@ -130,16 +130,18 @@ try {
     Write-Step "Checking existing Web and Worker instances ..."
     $webProcess = Get-ManagedProcess "web"
     $workerProcess = Get-ManagedProcess "worker"
+    $automationProcess = Get-ManagedProcess "automation"
     $webReachable = Test-App
     $useExistingWeb = $webReachable -and -not $webProcess
 
-    if ($webReachable -and $workerProcess) {
-        Write-OK "Web and Worker are already running; no duplicates started"
+    if ($webReachable -and $workerProcess -and $automationProcess) {
+        Write-OK "Web, analysis Worker and automation Worker are already running; no duplicates started"
         if (-not $NoBrowser -and -not $SmokeTest) { Start-Process -FilePath $AppUrl }
         return
     }
     if ($useExistingWeb) { Write-OK "Using the existing Web instance at $AppUrl" }
-    if ($workerProcess) { Write-OK "Worker is already running (PID $($workerProcess.Id))" }
+    if ($workerProcess) { Write-OK "Analysis Worker is already running (PID $($workerProcess.Id))" }
+    if ($automationProcess) { Write-OK "Automation Worker is already running (PID $($automationProcess.Id))" }
 
     if (-not $webProcess -and -not $useExistingWeb) {
         $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
@@ -167,8 +169,17 @@ try {
     Write-OK "Docker engine is ready"
 
     Write-Step "Starting PostgreSQL and checking readiness ..."
-    docker compose -f "$ComposeFile" up -d
-    Assert-NativeSuccess "docker compose up failed"
+    # A second Worktree has a different Compose project but the same fixed
+    # container name. Reuse the already-running local database container instead
+    # of asking Compose to create a conflicting container/network/volume stack.
+    $containerState = docker inspect --format "{{.State.Running}}" $ContainerName 2>$null
+    if ($LASTEXITCODE -eq 0 -and "$containerState".Trim() -eq "true") {
+        Write-OK "Existing PostgreSQL container is running; reusing it"
+    }
+    else {
+        docker compose -f "$ComposeFile" up -d
+        Assert-NativeSuccess "docker compose up failed"
+    }
     $databaseReady = $false
     $deadline = [DateTime]::Now.AddSeconds(90)
     while ([DateTime]::Now -lt $deadline) {
@@ -196,6 +207,14 @@ try {
             if ($workerProcess.HasExited) { throw "Worker exited during startup; inspect $LogDir\worker.error.log" }
         }
 
+        if (-not $automationProcess) {
+            Write-Step "Starting automation Worker ..."
+            $automationProcess = Start-ManagedProcess "automation" @("run", "worker:automation")
+            Start-Sleep -Seconds 2
+            $automationProcess.Refresh()
+            if ($automationProcess.HasExited) { throw "Automation Worker exited during startup; inspect $LogDir\automation.error.log" }
+        }
+
         if (-not $webProcess -and -not $useExistingWeb) {
             Write-Step "Starting Next.js development server ..."
             $webProcess = Start-ManagedProcess "web" @("run", "dev", "--", "--port", $Port.ToString())
@@ -216,9 +235,12 @@ try {
 
         $workerProcess.Refresh()
         if ($workerProcess.HasExited) { throw "Worker stopped during startup; inspect $LogDir\worker.error.log" }
-        Write-OK "Web is reachable at $AppUrl and Worker is running"
-        Write-Host "  Web log:    $(Join-Path $LogDir 'web.log')" -ForegroundColor Gray
-        Write-Host "  Worker log: $(Join-Path $LogDir 'worker.log')" -ForegroundColor Gray
+        $automationProcess.Refresh()
+        if ($automationProcess.HasExited) { throw "Automation Worker stopped during startup; inspect $LogDir\automation.error.log" }
+        Write-OK "Web is reachable at $AppUrl; analysis Worker and automation Worker are running"
+        Write-Host "  Web log:        $(Join-Path $LogDir 'web.log')" -ForegroundColor Gray
+        Write-Host "  Worker log:     $(Join-Path $LogDir 'worker.log')" -ForegroundColor Gray
+        Write-Host "  Automation log: $(Join-Path $LogDir 'automation.log')" -ForegroundColor Gray
 
         if ($SmokeTest) {
             Write-OK "Smoke test passed; only newly started processes will be stopped"

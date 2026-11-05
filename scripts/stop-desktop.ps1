@@ -11,7 +11,7 @@ function Stop-ProcessTree([int]$ProcessId) {
     Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
 }
 
-foreach ($name in @("web", "worker")) {
+foreach ($name in @("web", "worker", "automation")) {
     $recordPath = Join-Path $RuntimeDir "$name.json"
     if (-not (Test-Path $recordPath)) { continue }
     try {

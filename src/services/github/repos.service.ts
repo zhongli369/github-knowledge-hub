@@ -21,6 +21,9 @@ export interface GitHubRepo {
   license: string | null
   size: number
   pushedAt: string | null
+  // When returned by the starred endpoint with the custom `star+json` accept
+  // header; undefined on other endpoints (repo list, get details).
+  starredAt?: string | null
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -43,6 +46,7 @@ function mapRepo(raw: Record<string, any>): GitHubRepo {
     license: raw.license?.spdx_id ?? null,
     size: raw.size,
     pushedAt: raw.pushed_at,
+    starredAt: raw.starred_at ?? null,
   }
 }
 
@@ -59,15 +63,73 @@ export async function fetchUserRepos(userId: string): Promise<GitHubRepo[]> {
   return repos.map(mapRepo)
 }
 
+/**
+ * One item from the starred endpoint. With the `star+json` media type each item
+ * is an envelope `{ starred_at, repo: {...} }` (the star time sits OUTSIDE the
+ * nested repo object); without it the endpoint falls back to plain repo objects.
+ */
+interface StarredItem {
+  starred_at?: string | null
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  repo?: Record<string, any>
+}
+
+/**
+ * Normalize one paginated starred item (envelope or plain-repo form) to a
+ * `GitHubRepo`. The nested `repo` object carries the repository fields; the
+ * outer `starred_at` (when present) is threaded through as the star time so the
+ * sync can persist when the user actually starred the repo.
+ */
+function mapStarredItem(item: StarredItem): GitHubRepo {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const raw: Record<string, any> = item.repo ?? (item as unknown as Record<string, any>)
+  const mapped = mapRepo(raw)
+  if (item.repo) {
+    // The star time lives on the envelope, not inside the nested repo object.
+    mapped.starredAt = item.starred_at ?? null
+  }
+  return mapped
+}
+
 export async function fetchStarredRepos(userId: string): Promise<GitHubRepo[]> {
   const octokit = await createOctokit(userId)
 
+  // The `star+json` media type makes the starred endpoint include the
+  // `starred_at` field on every item; without it the response omits star time.
   const repos = await octokit.paginate(
     octokit.activity.listReposStarredByAuthenticatedUser,
-    { per_page: 100 }
+    {
+      per_page: 100,
+      headers: { accept: "application/vnd.github.star+json" },
+    }
   )
 
-  return repos.map((r) => mapRepo(r as Parameters<typeof mapRepo>[0]))
+  return repos.map(mapStarredItem)
+}
+
+/**
+ * Resolve the current HEAD commit SHA of a repository's default branch.
+ *
+ * Returns `null` for a 404 (missing repository/branch) and for repositories
+ * that have no commits yet (an empty repo exposes no branch commit). All other
+ * failures are classified so transient / rate-limit / auth issues surface as
+ * exceptions instead of being silently treated as "no head".
+ */
+export async function fetchRepositoryHeadSha(
+  userId: string,
+  owner: string,
+  repo: string,
+  defaultBranch: string
+): Promise<string | null> {
+  const octokit = await createOctokit(userId)
+
+  try {
+    const { data } = await octokit.repos.getBranch({ owner, repo, branch: defaultBranch })
+    return data.commit?.sha ?? null
+  } catch (error) {
+    if (isNotFound(error)) return null
+    return classifyGitHubError(error)
+  }
 }
 
 export async function fetchRepoReadme(
@@ -163,6 +225,8 @@ export async function syncRepoToDb(
       license: repo.license,
       size: repo.size,
       pushedAt: repo.pushedAt ? new Date(repo.pushedAt) : null,
+      starredAt: repo.starredAt ? new Date(repo.starredAt) : null,
+      unstarredAt: null,
       lastFetchedAt: new Date(),
       userId,
     },

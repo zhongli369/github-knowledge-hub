@@ -159,8 +159,50 @@ describe("GitHub repo fetch and sync (Octokit mocked)", () => {
 
     const repos = await fetchStarredRepos("user-1")
 
-    expect(paginate).toHaveBeenCalledWith(expect.any(Function), { per_page: 100 })
+    expect(paginate).toHaveBeenCalledWith(
+      expect.any(Function),
+      expect.objectContaining({
+        per_page: 100,
+        // star+json media type is required for the endpoint to include starred_at.
+        headers: { accept: "application/vnd.github.star+json" },
+      }),
+    )
     expect(repos[0].fullName).toBe("octocat/hello-world")
+  })
+
+  it("maps a star+json envelope item { starred_at, repo } and threads the star time through", async () => {
+    // With the `star+json` media type the starred endpoint wraps every repo in
+    // `{ starred_at, repo: {...} }`. The envelope's star time must reach the
+    // mapped result (owner/name/fullName drive the later HEAD/SHA flow).
+    const paginate = vi.fn().mockResolvedValue([
+      {
+        starred_at: "2025-06-01T12:00:00Z",
+        repo: { ...rawRepo },
+      },
+    ])
+    mocks.createOctokit.mockResolvedValue(
+      fakeOctokit({ paginate, activity: { listReposStarredByAuthenticatedUser: vi.fn() } }),
+    )
+
+    const repos = await fetchStarredRepos("user-1")
+
+    expect(paginate).toHaveBeenCalledWith(
+      expect.any(Function),
+      expect.objectContaining({
+        per_page: 100,
+        headers: { accept: "application/vnd.github.star+json" },
+      }),
+    )
+    expect(repos).toHaveLength(1)
+    expect(repos[0]).toMatchObject({
+      id: 123,
+      owner: "octocat",
+      name: "hello-world",
+      fullName: "octocat/hello-world",
+      defaultBranch: "main",
+      pushedAt: "2026-01-01T00:00:00Z",
+      starredAt: "2025-06-01T12:00:00Z",
+    })
   })
 
   it("decodes a base64 README", async () => {
