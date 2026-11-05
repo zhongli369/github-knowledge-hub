@@ -9,6 +9,7 @@ import {
   Code,
   Search,
   Sparkles,
+  Clock,
   type LucideIcon,
 } from "lucide-react"
 
@@ -34,6 +35,7 @@ const mainNav: NavItem[] = [
   { key: "assets", url: "/assets", icon: Code },
   { key: "discover", url: "/discover", icon: Search },
   { key: "analyses", url: "/analyses", icon: Sparkles },
+  { key: "automation", url: "/automation", icon: Clock },
 ]
 
 export function NavMain() {

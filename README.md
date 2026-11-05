@@ -131,6 +131,8 @@ npm run dev:all
 
 **Worker 提示：** 仓库摘要当前主要同步执行，不依赖 Worker；知识资产提取依赖 Worker。如果只启动 Web，提取任务会保持 `pending`。
 
+P3 自动同步在 `/automation` 配置，调度默认停用；启用周期同步或自动 AI 分析前，分别运行 `npm run worker:automation` 与 `npm run worker`。手动“立即执行”由 Web 发起同步，但自动摘要和资产提取仍由分析 Worker 消费。同步按 Star 状态、`pushedAt`、HEAD SHA 和内容指纹去重，取消 Star 只标记 `unstarredAt`，不会删除已有知识资产。
+
 ### 5. 桌面快捷方式
 
 Windows 桌面 `GitHub Knowledge Hub` 快捷方式调用 `scripts/start-desktop.ps1`，自动检查 Docker/PostgreSQL、migration 状态，启动 Web 和 Worker，并在页面可访问后打开浏览器。重复启动会复用现有实例。
@@ -152,12 +154,13 @@ npm run dev:local
 | `npm run dev:desktop` / `dev:desktop:stop` | 启动/停止脚本管理的桌面 Web 和 Worker |
 | `npm run dev:local` | WSL PostgreSQL 旧一键启动 |
 | `npm run worker` | 启动后台分析 Worker |
+| `npm run worker:automation` | 启动独立的周期同步调度 Worker |
 | `npm run typecheck` | TypeScript `--noEmit` |
-| `npm test` | 无数据库、无外部凭据的单元测试；2026-11-04 集中验证为 212 个通过 |
-| `npm run test:integration` | 每个测试文件使用独立 `gkh_test_*` 数据库；2026-11-04 为 59 个通过 |
+| `npm test` | 无数据库、无外部凭据的单元测试；2026-11-05 集中验证为 278 个通过 |
+| `npm run test:integration` | 每个测试文件使用独立 `gkh_test_*` 数据库；2026-11-05 为 61 个通过 |
 | `npm run build` / `start` | Next.js 生产构建 / 启动 |
 | `npm run lint` | ESLint；忽略构建产物、本地工具和日志 |
-| `npm run db:deploy` | 应用四条版本化 migrations，并验证 generated/GIN、leasing、用户维度唯一索引和 active Analysis 防重索引 |
+| `npm run db:deploy` | 应用五条版本化 migrations，并验证 generated/GIN、leasing、用户维度唯一索引、active Analysis 防重和单用户运行中 SyncRun 约束 |
 | `npm run db:baseline` / `db:baseline:apply` | 旧 `db push` 环境的安全检查 / 显式 baseline |
 | `npm run db:migrate` | 后续开发新 migration；先审查 diff，禁止用于绕过基线 |
 | `npm run db:push` | 保留的 Prisma 命令；不作为日常启动或既有数据升级方式 |
@@ -172,9 +175,11 @@ src/services/github/     GitHub API 服务
 src/services/llm/        摘要、Embedding、搜索、分析历史
 src/services/knowledge/  知识资产提取
 src/lib/                 Prisma/OpenAI/GitHub 客户端、加密 Adapter 和 Token 工具
-src/services/analysis/   Worker 原子领取、lease、heartbeat 与条件写入
-workers/                 独立分析 Worker
-prisma/migrations/       init、searchVector/GIN、Worker leasing、Repository 用户隔离
+src/services/analysis/   Worker 租约、自动分析去重与内容指纹
+src/services/automation/ 周期调度、配置和运行状态
+src/services/sync/       Starred 仓库增量同步
+workers/                 独立分析与自动同步 Worker
+prisma/migrations/       init、searchVector/GIN、leasing、用户隔离、P3 自动同步
 scripts/                 启动、停止、migration、存量 Token 迁移和隔离测试工具
 tests/unit/              无网络单元测试
 tests/integration/       隔离 PostgreSQL 与启动测试

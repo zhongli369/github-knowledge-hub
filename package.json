@@ -11,6 +11,7 @@
     "test": "vitest run",
     "test:integration": "node scripts/test-integration.mjs",
     "worker": "tsx workers/analysis-worker.ts",
+    "worker:automation": "tsx workers/automation-worker.ts",
     "dev:local": "powershell -ExecutionPolicy Bypass -File scripts/start-dev.ps1",
     "dev:all": "concurrently \"next dev\" \"tsx watch workers/analysis-worker.ts\"",
     "dev:desktop": "powershell -ExecutionPolicy Bypass -File scripts/start-desktop.ps1",

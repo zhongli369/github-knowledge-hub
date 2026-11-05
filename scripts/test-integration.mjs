@@ -94,23 +94,18 @@ async function seedLegacyDatabase(database) {
   const now = new Date("2026-01-01T00:00:00.000Z")
   try {
     await prisma.user.create({ data: { id: "legacy-user", name: "Legacy User", updatedAt: now } })
-    await prisma.repository.create({
-      data: {
-        id: "legacy-repo",
-        githubId: 42,
-        owner: "legacy",
-        name: "PostgreSQL Handbook",
-        fullName: "legacy/postgresql-handbook",
-        description: "Legacy search data",
-        url: "https://example.invalid/legacy/postgresql-handbook",
-        language: "TypeScript",
-        stars: 7,
-        topics: ["database", "search"],
-        userId: "legacy-user",
-        createdAt: now,
-        updatedAt: now,
-      },
-    })
+    // The generated Client reads current P3 columns even for an otherwise
+    // legacy-shaped create. Seed the pre-P3 database with explicit old columns
+    // so its INSERT/RETURNING never references fields added by later migrations.
+    await prisma.$executeRaw`
+      INSERT INTO "Repository"
+        ("id", "githubId", "owner", "name", "fullName", "description", "url",
+         "language", "stars", "topics", "userId", "createdAt", "updatedAt")
+      VALUES
+        ('legacy-repo', 42, 'legacy', 'PostgreSQL Handbook', 'legacy/postgresql-handbook',
+         'Legacy search data', 'https://example.invalid/legacy/postgresql-handbook',
+         'TypeScript', 7, ${["database", "search"]}, 'legacy-user', ${now}, ${now})
+    `
     // The current generated Client includes P1 columns in Analysis writes.
     // Seed the pre-P1 schema with explicit legacy columns instead.
     await prisma.$executeRaw`
@@ -162,12 +157,23 @@ try {
       "",
     )
     .replace(/^  @@index\(\[status, leaseExpiresAt\]\)\r?\n/m, "")
+    // Recreate the pre-P3 schema as well. The baseline deploy must apply the
+    // additive auto-sync migration instead of finding its columns already present.
+    .replace(/^  (?:headSha|syncHash|starredAt|unstarredAt)\s+String\?[^\n]*\r?\n/gm, "")
+    .replace(/^  starredAt\s+DateTime\?[^\n]*\r?\n/gm, "")
+    .replace(/^  unstarredAt\s+DateTime\?[^\n]*\r?\n/gm, "")
+    .replace(/^  (?:sourceSha|contentHash)\s+String\?[^\n]*\r?\n/gm, "")
+    .replace(/^  automationSettings\s+AutomationSettings\?[^\n]*\r?\n/m, "")
+    .replace(/^  syncRuns\s+SyncRun\[\][^\n]*\r?\n/m, "")
+    .replace(/^model AutomationSettings \{[\s\S]*?^\}\r?\n(?:\r?\n)?/m, "")
+    .replace(/^model SyncRun \{[\s\S]*?^\}\r?\n(?:\r?\n)?/m, "")
   if (
     legacySchema === currentSchema ||
     legacySchema.includes("@@index([searchVector]") ||
     legacySchema.includes("leaseExpiresAt") ||
     legacySchema.includes("@@index([status, leaseExpiresAt]") ||
     legacySchema.includes("@@unique([userId, githubId]") ||
+    /\b(?:headSha|syncHash|starredAt|unstarredAt|sourceSha|contentHash|AutomationSettings|SyncRun)\b/.test(legacySchema) ||
     !legacySchema.includes("githubId        Int              @unique") ||
     !legacySchema.includes("fullName        String           @unique")
   ) {

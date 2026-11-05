@@ -167,8 +167,17 @@ try {
     Write-OK "Docker engine is ready"
 
     Write-Step "Starting PostgreSQL and checking readiness ..."
-    docker compose -f "$ComposeFile" up -d
-    Assert-NativeSuccess "docker compose up failed"
+    # A second Worktree has a different Compose project but the same fixed
+    # container name. Reuse the already-running local database container instead
+    # of asking Compose to create a conflicting container/network/volume stack.
+    $containerState = docker inspect --format "{{.State.Running}}" $ContainerName 2>$null
+    if ($LASTEXITCODE -eq 0 -and "$containerState".Trim() -eq "true") {
+        Write-OK "Existing PostgreSQL container is running; reusing it"
+    }
+    else {
+        docker compose -f "$ComposeFile" up -d
+        Assert-NativeSuccess "docker compose up failed"
+    }
     $databaseReady = $false
     $deadline = [DateTime]::Now.AddSeconds(90)
     while ([DateTime]::Now -lt $deadline) {

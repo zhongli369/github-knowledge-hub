@@ -10,6 +10,7 @@ const initialMigration = "20261103230000_init"
 const searchMigration = "20261103231000_repository_search_vector"
 const workerLeasingMigration = "20261104101530_analysis_worker_leasing"
 const repositoryIsolationMigration = "20261104190000_repository_user_isolation"
+const autoSyncMigration = "20261105120000_p3_auto_sync"
 const prismaCli = path.join(root, "node_modules", "prisma", "build", "index.js")
 
 if (!process.env.DATABASE_URL && existsSync(path.join(root, ".env"))) {
@@ -112,16 +113,29 @@ async function verifyMigratedSchema(prisma) {
     throw new Error("Analysis active-task partial unique index is missing")
   }
 
+  const runningSyncIndexes = await prisma.$queryRawUnsafe(`
+    SELECT indexdef FROM pg_indexes
+    WHERE schemaname = 'public' AND tablename = 'SyncRun'
+      AND indexname = 'SyncRun_userId_running_key'
+  `)
+  if (
+    runningSyncIndexes.length !== 1 ||
+    !runningSyncIndexes[0].indexdef.includes("UNIQUE INDEX") ||
+    !runningSyncIndexes[0].indexdef.includes("WHERE")
+  ) {
+    throw new Error("SyncRun per-user running-task partial unique index is missing")
+  }
+
   const migrations = await prisma.$queryRawUnsafe(`
     SELECT migration_name, finished_at, rolled_back_at
     FROM "_prisma_migrations"
-    WHERE migration_name IN ($1, $2, $3, $4)
-  `, initialMigration, searchMigration, workerLeasingMigration, repositoryIsolationMigration)
+    WHERE migration_name IN ($1, $2, $3, $4, $5)
+  `, initialMigration, searchMigration, workerLeasingMigration, repositoryIsolationMigration, autoSyncMigration)
   if (
-    migrations.length !== 4 ||
+    migrations.length !== 5 ||
     migrations.some((migration) => !migration.finished_at || migration.rolled_back_at)
   ) {
-    throw new Error("Prisma migration history does not contain all four successful migrations")
+    throw new Error("Prisma migration history does not contain all five successful migrations")
   }
 }
 
@@ -167,8 +181,71 @@ async function assertBaselineEligible(prisma) {
     "-- AlterTable",
     'ALTER TABLE "Analysis" ADD COLUMN     "attempts" INTEGER NOT NULL DEFAULT 0,',
     'ADD COLUMN     "claimedAt" TIMESTAMP(3),',
+    'ADD COLUMN     "contentHash" TEXT,',
     'ADD COLUMN     "leaseExpiresAt" TIMESTAMP(3),',
+    'ADD COLUMN     "sourceSha" TEXT,',
     'ADD COLUMN     "workerId" TEXT;',
+    "",
+    "-- AlterTable",
+    'ALTER TABLE "KnowledgeAsset" ADD COLUMN     "contentHash" TEXT,',
+    'ADD COLUMN     "sourceSha" TEXT;',
+    "",
+    "-- AlterTable",
+    'ALTER TABLE "Repository" ADD COLUMN     "headSha" TEXT,',
+    'ADD COLUMN     "starredAt" TIMESTAMP(3),',
+    'ADD COLUMN     "syncHash" TEXT,',
+    'ADD COLUMN     "unstarredAt" TIMESTAMP(3);',
+    "",
+    "-- CreateTable",
+    'CREATE TABLE "AutomationSettings" (',
+    '    "id" TEXT NOT NULL,',
+    '    "userId" TEXT NOT NULL,',
+    '    "enabled" BOOLEAN NOT NULL DEFAULT false,',
+    '    "autoAnalyze" BOOLEAN NOT NULL DEFAULT true,',
+    '    "intervalMinutes" INTEGER NOT NULL DEFAULT 60,',
+    '    "nextSyncAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,',
+    '    "leaseExpiresAt" TIMESTAMP(3),',
+    '    "workerId" TEXT,',
+    '    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,',
+    '    "updatedAt" TIMESTAMP(3) NOT NULL,',
+    "",
+    '    CONSTRAINT "AutomationSettings_pkey" PRIMARY KEY ("id")',
+    ');',
+    "",
+    "-- CreateTable",
+    'CREATE TABLE "SyncRun" (',
+    '    "id" TEXT NOT NULL,',
+    '    "userId" TEXT NOT NULL,',
+    '    "trigger" TEXT NOT NULL,',
+    '    "status" TEXT NOT NULL,',
+    '    "totalCount" INTEGER NOT NULL DEFAULT 0,',
+    '    "processedCount" INTEGER NOT NULL DEFAULT 0,',
+    '    "addedCount" INTEGER NOT NULL DEFAULT 0,',
+    '    "updatedCount" INTEGER NOT NULL DEFAULT 0,',
+    '    "unchangedCount" INTEGER NOT NULL DEFAULT 0,',
+    '    "unstarredCount" INTEGER NOT NULL DEFAULT 0,',
+    '    "failedCount" INTEGER NOT NULL DEFAULT 0,',
+    '    "analysisQueuedCount" INTEGER NOT NULL DEFAULT 0,',
+    '    "error" TEXT,',
+    '    "startedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,',
+    '    "finishedAt" TIMESTAMP(3),',
+    '    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,',
+    '    "updatedAt" TIMESTAMP(3) NOT NULL,',
+    "",
+    '    CONSTRAINT "SyncRun_pkey" PRIMARY KEY ("id")',
+    ');',
+    "",
+    "-- CreateIndex",
+    'CREATE UNIQUE INDEX "AutomationSettings_userId_key" ON "AutomationSettings"("userId");',
+    "",
+    "-- CreateIndex",
+    'CREATE INDEX "AutomationSettings_enabled_nextSyncAt_idx" ON "AutomationSettings"("enabled", "nextSyncAt");',
+    "",
+    "-- CreateIndex",
+    'CREATE INDEX "SyncRun_userId_createdAt_idx" ON "SyncRun"("userId", "createdAt");',
+    "",
+    "-- CreateIndex",
+    'CREATE INDEX "SyncRun_status_idx" ON "SyncRun"("status");',
     "",
     "-- CreateIndex",
     'CREATE INDEX "Analysis_status_leaseExpiresAt_idx" ON "Analysis"("status", "leaseExpiresAt");',
@@ -181,6 +258,12 @@ async function assertBaselineEligible(prisma) {
     "",
     "-- CreateIndex",
     'CREATE UNIQUE INDEX "Repository_userId_fullName_key" ON "Repository"("userId", "fullName");',
+    "",
+    "-- AddForeignKey",
+    'ALTER TABLE "AutomationSettings" ADD CONSTRAINT "AutomationSettings_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;',
+    "",
+    "-- AddForeignKey",
+    'ALTER TABLE "SyncRun" ADD CONSTRAINT "SyncRun_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;',
   ].join("\n")
   if (diff !== expectedLegacyDiff) {
     throw new Error(`Database differs from the legacy schema in unexpected ways; baseline refused.\n${diff}`)
